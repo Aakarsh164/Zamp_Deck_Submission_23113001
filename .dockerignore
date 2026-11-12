@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+app.db
+.venv/
+__pycache__/
+test_invoices/
+.git/

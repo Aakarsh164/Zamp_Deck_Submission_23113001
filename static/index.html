@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Forward-to-Decide</title>
+<style>
+:root{--bg:#eef1ef;--card:#fff;--ink:#13201c;--mut:#5f6f69;--line:#d9e0dc;--ok:#166534;--warn:#92400e;--bad:#b91c1c;--info:#1e40af;--acc:#0f5f55}
+@media(prefers-color-scheme:dark){:root{--bg:#0e1412;--card:#161e1b;--ink:#e6eeea;--mut:#92a39c;--line:#27332f;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--info:#93b4ff;--acc:#5eead4}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Source Serif 4",Georgia,serif}
+h1,h2,h3,button,table,.mono{font-family:"Inter",system-ui,sans-serif}
+header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;padding:20px 28px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+h1{margin:0;font-size:22px;letter-spacing:-.02em}header p{margin:2px 0 0;color:var(--mut)}
+.big{font:600 40px/1 "Inter",sans-serif;color:var(--acc)}.big small{font-size:13px;color:var(--mut);font-weight:400;margin-left:8px}
+main{display:grid;grid-template-columns:320px 1fr;gap:20px;padding:20px 28px;max-width:1280px;margin:auto}
+@media(max-width:860px){main{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px;margin-bottom:20px}
+h2{font-size:15px;margin:0 0 10px}
+button{font:500 13px Inter,sans-serif;padding:8px 12px;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:4px;cursor:pointer}
+button:hover{border-color:var(--acc)}button:focus-visible,input:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+button.pri{background:var(--acc);color:#fff;border-color:var(--acc)}@media(prefers-color-scheme:dark){button.pri{color:#06201c}}
+.samples{display:flex;flex-direction:column;gap:6px}.samples button{text-align:left}
+.stage{display:grid;grid-template-columns:20px 120px 1fr 56px;gap:8px;padding:7px 0;border-bottom:1px solid var(--line);font-size:14px}
+.stage:last-child{border:0}.dot{width:10px;height:10px;border-radius:50%;margin-top:6px;background:var(--line)}
+.running .dot{background:var(--info);animation:p 1s infinite}.done .dot{background:var(--ok)}.error .dot{background:var(--bad)}
+@keyframes p{50%{opacity:.3}}@media(prefers-reduced-motion:reduce){.running .dot{animation:none}}
+.mut{color:var(--mut)}.badge{display:inline-block;padding:3px 10px;border-radius:3px;font:600 13px Inter,sans-serif}
+.AUTO_APPROVE{background:var(--ok);color:#fff}.AUTO_REJECT{background:var(--bad);color:#fff}.REVIEW{background:var(--info);color:#fff}.HOLD_FOR_INFO{background:var(--warn);color:#fff}.ESCALATE{background:var(--bad);color:#fff}
+@media(prefers-color-scheme:dark){.badge{color:#0e1412!important}}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}th{color:var(--mut);font-weight:500}
+tbody tr.click{cursor:pointer}tbody tr.click:hover{background:var(--bg)}
+.pass{color:var(--ok)}.warn{color:var(--warn)}.fail{color:var(--bad)}
+pre{white-space:pre-wrap;background:var(--bg);padding:10px;border-radius:4px;font-size:13px}
+.bar{height:6px;background:var(--line);border-radius:3px;min-width:80px}.bar i{display:block;height:6px;background:var(--acc);border-radius:3px}
+ul{margin:6px 0;padding-left:20px}
+</style><link rel="stylesheet" href="/dashboard.css"></head><body>
+<header><div><h1>Forward-to-Decide</h1><p>An AP inbox that starts at zero trust and earns autonomy one approval at a time.</p></div>
+<div class="big"><span id="auto">0%</span><small id="autoSub">of invoices handled without a human</small></div></header>
+<nav class="tabs" aria-label="Dashboard sections">
+ <button class="tab active" data-page="overview">Overview</button>
+ <button class="tab" data-page="invoices">Invoices</button>
+ <button class="tab" data-page="vendors-page">Vendors</button>
+ <button class="tab" data-page="email-page">Email History</button>
+ <button class="tab" data-page="analytics-page">Analytics</button>
+</nav>
+<div class="filterbar">
+ <label>From <input type="date" id="dateFrom"></label>
+ <label>To <input type="date" id="dateTo"></label>
+ <label>Vendor <select id="filterVendor"><option value="">All vendors</option></select></label>
+ <label>Decision <select id="filterAction"><option value="">All decisions</option></select></label>
+ <label>Status <select id="filterStatus"><option value="">All statuses</option></select></label>
+ <label>Email <select id="filterEmail"><option value="">All email statuses</option></select></label>
+ <button id="clearFilters">Clear filters</button>
+</div>
+<main id="main">
+<aside>
+ <div class="card"><h2>Run an invoice</h2>
+  <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.webp" aria-label="Invoice file">
+  <p><button class="pri" id="go">Run invoice</button></p>
+  <label class="admin-token-label">Admin token (deployed instances only)
+   <input type="password" id="adminToken" autocomplete="off" placeholder="Optional">
+  </label>
+  <h2>Or try a sample</h2><div class="samples" id="samples"></div>
+  <p><button id="reset">Reset demo data</button></p></div>
+ <div class="card"><h2>Rule proposals</h2><div id="props" class="mut">None yet.</div></div>
+ <div class="card"><h2>Vendor trust</h2><table><tbody id="vendors"></tbody></table></div>
+</aside>
+<section id="overview" class="page-view">
+ <div class="kpis">
+  <div class="kpi"><span>Total processed</span><strong id="kpi-total">0</strong></div>
+  <div class="kpi"><span>Auto-approved</span><strong id="kpi-auto-approved">0</strong></div>
+  <div class="kpi"><span>Auto-rejected</span><strong id="kpi-auto-rejected">0</strong></div>
+  <div class="kpi"><span>Pending human review</span><strong id="kpi-pending">0</strong></div>
+  <div class="kpi"><span>Invoices on hold</span><strong id="kpi-hold">0</strong></div>
+  <div class="kpi"><span>Escalated invoices</span><strong id="kpi-escalated">0</strong></div>
+  <div class="kpi"><span>Total invoice value</span><strong id="kpi-value">$0.00</strong></div>
+  <div class="kpi accent"><span>Automation rate</span><strong id="kpi-rate">0%</strong></div>
+ </div>
+ <div class="card"><h2>Invoice processing trends</h2><div id="chart-trends"></div></div>
+ <div class="card"><h2>Recent activity</h2><div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Vendor</th><th>Amount</th><th>Decision</th><th>Processed</th><th>Email</th></tr></thead><tbody id="recent"></tbody></table></div></div>
+ <div class="card"><h2>Automation over time</h2><div id="curve"></div><p class="mut">Actual invoice records only; demonstration seed data is excluded.</p></div>
+ <div class="card"><h2>The Gauntlet</h2><p class="mut" style="margin:0 0 8px">Hostile invoices run on a scratch database. Your live data is untouched.</p><button class="pri" id="gaunt">Run the Gauntlet</button><div id="score"></div></div>
+ <div class="card"><h2>Pipeline</h2><div id="stages" class="mut">Pick an invoice to start. Each stage appears here as it runs.</div></div>
+ <div class="card" id="decision" hidden></div>
+ <div class="card"><h2>Run history</h2><table><thead><tr><th>Invoice</th><th>Vendor</th><th>PO</th><th>Total</th><th>Action</th><th>Status</th><th>Email</th></tr></thead><tbody id="runs"></tbody></table></div>
+</section>
+<section id="invoices" class="page-view tab-page" hidden><div class="card"><h2>Invoices</h2><div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Vendor</th><th>PO</th><th>Amount</th><th>Decision</th><th>Status</th><th>Email</th><th>Processed</th></tr></thead><tbody id="invoiceRows"></tbody></table></div></div></section>
+<section id="vendors-page" class="page-view tab-page" hidden><div class="card"><h2>Vendor performance</h2><div class="table-wrap"><table><thead><tr><th>Vendor</th><th>Email contact</th><th>Invoices</th><th>Approved</th><th>Rejected</th><th>Escalated</th><th>Trust</th><th>Value</th><th>Automation</th></tr></thead><tbody id="vendorPerformance"></tbody></table></div></div></section>
+<section id="email-page" class="page-view tab-page" hidden><div class="card"><h2>Vendor email history</h2><div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Vendor</th><th>Recipient</th><th>Subject</th><th>Status</th><th>Time</th><th>Message / status detail</th><th></th></tr></thead><tbody id="emailRows"></tbody></table></div></div></section>
+<section id="analytics-page" class="page-view tab-page" hidden>
+ <div class="chart-grid">
+  <div class="card"><h2>Decision distribution</h2><div id="chart-decisions"></div></div>
+  <div class="card"><h2>Vendor invoice volume</h2><div id="chart-vendors"></div></div>
+  <div class="card"><h2>Vendor approval and rejection rates</h2><div id="chart-vendor-rates"></div></div>
+  <div class="card"><h2>Monthly invoice value</h2><div id="chart-monthly"></div></div>
+  <div class="card"><h2>Human intervention vs automation</h2><div id="chart-mode"></div></div>
+  <div class="card"><h2>Email delivery outcomes</h2><div id="chart-emails"></div></div>
+ </div>
+</section>
+</main>
+<script type="text/plain" id="legacy-app">
+const $=id=>document.getElementById(id),esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const money=n=>n==null?"missing":"$"+Number(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+function curve(s){
+ const W=560,H=150,p=28;if(!s.length){$("curve").innerHTML="";return}
+ const pts=s.map((q,i)=>{const w=s.slice(Math.max(0,i-6),i+1),t=w.reduce((a,b)=>a+b.total,0),u=w.reduce((a,b)=>a+b.auto,0);return{...q,pct:t?100*u/t:0,i}});
+ const x=i=>p+i*(W-2*p)/Math.max(1,pts.length-1),y=v=>H-p-(v/100)*(H-2*p),line=a=>a.map(q=>x(q.i)+","+y(q.pct)).join(" ");
+ const sim=pts.filter(q=>q.seeded),live=pts.filter(q=>!q.seeded),join=live.length&&sim.length?[sim[sim.length-1],...live]:live;
+ const grid=[0,50,100].map(v=>`<line x1="${p}" x2="${W-p}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/><text x="2" y="${y(v)+4}" font-size="11" fill="var(--mut)">${v}%</text>`).join("");
+ $("curve").innerHTML=`<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Share of invoices handled without a human over time">${grid}
+ <polyline points="${line(sim)}" fill="none" stroke="var(--mut)" stroke-width="2" stroke-dasharray="5 4"/>
+ ${join.length>1?`<polyline points="${line(join)}" fill="none" stroke="var(--acc)" stroke-width="2.5"/>`:""}
+ ${live.map(q=>`<circle cx="${x(q.i)}" cy="${y(q.pct)}" r="4" fill="var(--acc)"/>`).join("")}</svg>`}
+async function refresh(){
+ const [r,v,s]=await Promise.all(["runs","vendors","stats"].map(x=>fetch("/api/"+x).then(r=>r.json())));
+ $("auto").textContent=s.autonomy+"%";$("autoSub").textContent=`of invoices handled without a human (${s.auto} of ${s.total})`;
+ curve(s.series);loadProps();
+ $("vendors").innerHTML=v.map(x=>`<tr><td>${esc(x.name)}<div class="bar"><i style="width:${Math.min(100,100*x.points/x.threshold)}%"></i></div></td><td>${x.points}/${x.threshold}</td></tr>`).join("");
+ $("runs").innerHTML=r.length?r.map(x=>`<tr class="click" data-id="${x.id}"><td>${esc(x.invoice_number||x.filename)}</td><td>${esc(x.vendor)}</td><td>${esc(x.po_id||"-")}</td><td>${money(x.total)}</td><td><span class="badge ${x.action}">${x.action}</span></td><td>${x.status}</td><td>${esc(x.email_status||"-")}</td></tr>`).join(""):'<tr><td colspan="7" class="mut">No runs yet. Run a sample to get started.</td></tr>';
+ document.querySelectorAll("tr.click").forEach(t=>t.onclick=async()=>{const d=await fetch("/api/runs/"+t.dataset.id).then(r=>r.json());showDecision(t.dataset.id,d.status,d.decision)});
+}
+function showDecision(id,status,d){
+ const el=$("decision");el.hidden=false;
+ const ck=d.checks.map(c=>`<tr><td>${c.rule}</td><td class="${c.status}">${c.status}${c.hard?" (hard stop)":""}</td><td>${esc(c.detail)}</td></tr>`).join("");
+ el.innerHTML=`<h2>Decision</h2><p><span class="badge ${d.action}">${d.action}</span> &nbsp;recommendation: <b>${d.recommendation}</b> &nbsp;confidence: <b>${d.confidence}</b> &nbsp;status: <b>${status}</b></p>
+ <p>${esc(d.decision_explanation||"")}</p>
+ <p><b>Why</b></p><ul>${d.reasons.map(r=>`<li>${esc(r)}</li>`).join("")}</ul>
+ ${d.what_would_change_it.length?`<p><b>What would change it</b></p><ul>${d.what_would_change_it.map(r=>`<li>${esc(r)}</li>`).join("")}</ul>`:""}
+ ${d.vendor_email?`<p><b>Vendor email: ${esc(d.vendor_email.status)}</b>${d.vendor_email.recipient?` &nbsp;to ${esc(d.vendor_email.recipient)}`:""}</p>${d.vendor_email.status==="sent"?'<p class="pass">SMTP server accepted the message.</p>':""}${d.vendor_email.error?`<p class="fail">${esc(d.vendor_email.error)}</p>`:""}<pre>Subject: ${esc(d.vendor_email.subject)}\n\n${esc(d.vendor_email.body)}</pre>`:""}
+ <table><thead><tr><th>Rule</th><th>Result</th><th>Detail</th></tr></thead><tbody>${ck}</tbody></table>
+ ${status==="pending"?`<p><button class="pri" onclick="review('${id}','approve')">Approve</button> <button onclick="review('${id}','reject')">Reject</button></p>`:""}`;
+}
+async function review(id,verdict){await fetch(`/api/runs/${id}/review`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({verdict})});
+ const d=await fetch("/api/runs/"+id).then(r=>r.json());showDecision(id,d.status,d.decision);refresh()}
+let rows={};
+function handle(e){if(e.type==="start"){rows={};$("stages").innerHTML="";$("decision").hidden=true}
+ if(e.type==="stage"){let r=rows[e.name];if(!r){r=rows[e.name]=document.createElement("div");$("stages").appendChild(r)}
+  r.className="stage "+e.status;r.innerHTML=`<span class="dot"></span><b>${esc(e.name)}</b><span class="${e.status==="error"?"fail":""}">${esc(e.summary)}</span><span class="mut mono">${e.ms?e.ms+"ms":""}</span>`}
+ if(e.type==="decision"){showDecision(e.run_id,e.status,e.decision);refresh()}}
+async function stream(url,opts){const res=await fetch(url,opts);if(!res.ok){$("stages").textContent=(await res.json()).detail||"Request failed";return}
+ const rd=res.body.getReader(),dec=new TextDecoder();let buf="";
+ while(true){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});const ls=buf.split("\n");buf=ls.pop();ls.filter(Boolean).forEach(l=>handle(JSON.parse(l)))}
+ refresh()}
+let cur=null;setInterval(async()=>{const d=await fetch("/api/live?after="+(cur??999999)).then(r=>r.json());cur=d.cursor;d.events.forEach(handle)},1500);
+async function loadProps(){const p=await fetch("/api/proposals").then(r=>r.json());
+ $("props").innerHTML=p.length?p.map(x=>`<p>You approved ${esc(x.vendor)} over its PO ${x.count} times (up to ${x.max_over}% over). Make ${x.proposed}% their tolerance? <button onclick="acceptProp('${x.vendor_id}',${x.proposed})">Accept</button></p>`).join(""):"None yet. They appear after repeated overrides."}
+async function acceptProp(v,t){await fetch("/api/proposals/accept",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({vendor_id:v,tol:t/100})});refresh()}
+$("gaunt").onclick=async()=>{$("score").textContent="Running...";const g=await fetch("/api/gauntlet",{method:"POST"}).then(r=>r.json());
+ $("score").innerHTML=`<p><b>Handled correctly: ${g.correct} of ${g.total}.</b> False escalations on clean invoices: <b>${g.false_escalations}</b>.</p><table><thead><tr><th>Case</th><th>Expected</th><th>Got</th><th></th></tr></thead><tbody>${g.cases.map(c=>`<tr><td>${esc(c.label)}${c.ok?"":`<div class="fail">${esc(c.note)}</div>`}</td><td>${c.expected}</td><td>${c.got}</td><td class="${c.ok?"pass":"fail"}">${c.ok?"correct":"missed"}</td></tr>`).join("")}</tbody></table>`};
+$("go").onclick=()=>{const f=$("file").files[0];if(!f)return alert("Choose an invoice file first");const fd=new FormData();fd.append("file",f);fd.append("source","upload");stream("/api/run",{method:"POST",body:fd})};
+$("reset").onclick=async()=>{await fetch("/api/reset",{method:"POST"});$("stages").textContent="Demo data cleared.";$("decision").hidden=true;refresh()};
+fetch("/api/samples").then(r=>r.json()).then(s=>{$("samples").innerHTML=s.map(x=>`<button data-k="${x.key}">${esc(x.label)}</button>`).join("");
+ document.querySelectorAll("#samples button").forEach(b=>b.onclick=()=>stream("/api/sample/"+b.dataset.k,{method:"POST"}))});
+refresh();
+</script><script src="/dashboard.js"></script></body></html>

@@ -1,7 +1,7 @@
-import asyncio, base64, calendar, hashlib, hmac, json, math, os, random, sqlite3, time, uuid
+import asyncio, base64, calendar, hashlib, hmac, ipaddress, json, math, os, random, sqlite3, time, uuid
 from dotenv import load_dotenv
 load_dotenv()
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -9,7 +9,67 @@ import db, rules, extract, gauntlet, email_service
 from data import VENDORS, TRUST_THRESHOLD
 from samples import SAMPLES
 
-app = FastAPI()
+def _require_admin(request):
+    if _is_loopback_request(request):
+        return
+    expected = os.getenv("ADMIN_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(503, "ADMIN_TOKEN is not configured")
+    supplied = request.headers.get("X-Admin-Token", "")
+    authorization = request.headers.get("Authorization", "")
+    if not supplied and authorization.lower().startswith("basic "):
+        try:
+            decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            decoded = ""
+        username, separator, password = decoded.partition(":")
+        if separator and username == "admin":
+            supplied = password
+    if not supplied:
+        raise HTTPException(
+            401, "Authentication required",
+            headers={"WWW-Authenticate": 'Basic realm="Forward-to-Decide"'},
+        )
+    if not hmac.compare_digest(supplied, expected):
+        raise HTTPException(403, "Invalid authentication credentials")
+
+
+def _require_inbound(request):
+    if _is_loopback_request(request):
+        return
+    expected = os.getenv("INBOUND_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(503, "INBOUND_TOKEN is not configured")
+    supplied = request.headers.get("X-Inbound-Token", "")
+    if not supplied:
+        raise HTTPException(401, "Inbound authentication required")
+    if not hmac.compare_digest(supplied, expected):
+        raise HTTPException(403, "Invalid inbound credentials")
+
+
+def _is_loopback_request(request):
+    client = getattr(request, "client", None)
+    if client is None:
+        return False
+    try:
+        return ipaddress.ip_address(client.host).is_loopback
+    except ValueError:
+        return False
+
+
+def _authenticate_api(request: Request):
+    path = request.url.path
+    if not path.startswith("/api/"):
+        return
+    if _is_loopback_request(request):
+        return
+    if path == "/api/inbound" or path.startswith("/api/inbound/"):
+        _require_inbound(request)
+        return
+    _require_admin(request)
+
+
+app = FastAPI(dependencies=[Depends(_authenticate_api)])
 db.init()
 MIMES = {"application/pdf", "image/png", "image/jpeg", "image/webp"}
 EXT = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
@@ -43,15 +103,6 @@ def _check_upload_rate(request):
     UPLOAD_RATE_LIMITS[ip] = recent
 
 
-def _require_admin(request):
-    expected = os.getenv("ADMIN_TOKEN", "")
-    if not expected:
-        return
-    supplied = request.headers.get("X-Admin-Token") or request.query_params.get("admin_token", "")
-    if not hmac.compare_digest(supplied, expected):
-        raise HTTPException(403, "A valid ADMIN_TOKEN is required")
-
-
 async def _validated_upload(request, file):
     _check_upload_rate(request)
     extension_mime = EXT.get(os.path.splitext(file.filename or "")[1].lower())
@@ -75,77 +126,285 @@ def S(name, status, summary="", ms=None): return ev(type="stage", name=name, sta
 
 def _email_history(c, run_id):
     rows = c.execute(
-        "select id,recipient,subject,body,status,error,created_at,attempted_at,completed_at "
+        "select id,recipient,recipient_source,recipient_note,subject,body,status,error,"
+        "created_at,attempted_at,completed_at "
         "from email_notifications where run_id=? order by id",
         (run_id,),
     ).fetchall()
     return [dict(row) for row in rows]
 
 
+def _email_is_allowlisted(address):
+    normalized = email_service.normalize_email(address)
+    if not normalized:
+        return False
+    return normalized in {
+        candidate
+        for candidate in (
+            email_service.normalize_email(item)
+            for item in os.getenv("EMAIL_ALLOWLIST", "").split(",")
+        )
+        if candidate
+    }
+
+
+def _register_vendor_email(c, vendor_id, vendor_score, invoice, file_hash):
+    raw_address = invoice.get("vendor_email")
+    if not isinstance(raw_address, str) or not raw_address.strip():
+        return None
+    address = raw_address.strip().lower()
+    normalized = email_service.normalize_email(address)
+    confidence = (invoice.get("confidence") or {}).get("vendor_email")
+    vendor_confidence = (invoice.get("confidence") or {}).get("vendor_name")
+    now = time.time()
+    reason = None
+    authorized = False
+
+    if not normalized:
+        reason = "The extracted address is not a valid email address."
+    elif (
+        not vendor_id
+        or not VENDORS.get(vendor_id, {}).get("active")
+        or not 0.90 <= vendor_score <= 1.0
+        or not isinstance(vendor_confidence, (int, float))
+        or isinstance(vendor_confidence, bool)
+        or not 0.90 <= vendor_confidence <= 1.0
+    ):
+        reason = "Vendor identity or its extraction confidence is below the 90% authorization threshold."
+    elif (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not 0.90 <= confidence <= 1.0
+    ):
+        reason = "Email extraction confidence is below the 90% authorization threshold."
+    elif normalized.rsplit("@", 1)[1] not in {
+        domain.lower().lstrip("@")
+        for domain in VENDORS[vendor_id].get("domains", [])
+    }:
+        reason = "The email domain does not match a configured domain for this vendor."
+    else:
+        master = c.execute(
+            "select email from vendors where vendor_id=?", (vendor_id,)
+        ).fetchone()
+        master_email = email_service.normalize_email(master["email"]) if master else None
+        if master_email and master_email != normalized:
+            reason = "The address conflicts with the vendor's saved contact."
+        else:
+            other_vendor = c.execute(
+                "select vendor_id from vendor_email_addresses "
+                "where email=? and vendor_id!=? and authorization_status='AUTHORIZED' limit 1",
+                (normalized, vendor_id),
+            ).fetchone()
+            other_master = c.execute(
+                "select vendor_id from vendors "
+                "where lower(trim(email))=? and vendor_id!=? limit 1",
+                (normalized, vendor_id),
+            ).fetchone()
+            if other_vendor or other_master:
+                reason = "The address is already associated with a different vendor."
+            else:
+                authorized = True
+                reason = (
+                    "Automatically authorized: exact configured vendor domain, "
+                    "vendor identity and extraction confidences are at least 90%, "
+                    "and no conflicting contact exists."
+                )
+
+    prior = c.execute(
+        "select * from vendor_email_addresses where vendor_id=? and email=?",
+        (vendor_id, address),
+    ).fetchone() if vendor_id else None
+    current_domain_verified = bool(
+        normalized
+        and normalized.rsplit("@", 1)[1] in {
+            domain.lower().lstrip("@")
+            for domain in VENDORS.get(vendor_id, {}).get("domains", [])
+        }
+    )
+    if (
+        prior and prior["authorization_status"] == "AUTHORIZED"
+        and current_domain_verified
+        and not (reason and ("conflicts" in reason or "different vendor" in reason))
+    ):
+        authorized = True
+        reason = prior["authorization_reason"]
+        file_hash = prior["source_invoice_hash"]
+        confidence = prior["extraction_confidence"]
+
+    status = "AUTHORIZED" if authorized else "PENDING_REVIEW"
+    c.execute(
+        "insert into vendor_email_addresses"
+        "(vendor_id,email,source_invoice_hash,extraction_confidence,authorization_status,"
+        "authorization_reason,created_at,updated_at) values(?,?,?,?,?,?,?,?) "
+        "on conflict(vendor_id,email) do update set "
+        "source_invoice_hash=excluded.source_invoice_hash,"
+        "extraction_confidence=excluded.extraction_confidence,"
+        "authorization_status=excluded.authorization_status,"
+        "authorization_reason=excluded.authorization_reason,updated_at=excluded.updated_at",
+        (vendor_id, address, file_hash, confidence, status, reason, now, now),
+    )
+    return {
+        "email": address,
+        "authorization_status": status,
+        "authorization_reason": reason,
+        "extraction_confidence": confidence,
+    }
+
+
+def _authorized_vendor_email(c, vendor_id, *, address=None, master_contact=None):
+    parameters = [vendor_id]
+    query = (
+        "select * from vendor_email_addresses where vendor_id=? "
+        "and authorization_status='AUTHORIZED'"
+    )
+    if address:
+        query += " and email=?"
+        parameters.append(address)
+    query += " order by updated_at desc,id desc"
+    master = email_service.normalize_email(master_contact)
+    configured_domains = {
+        domain.lower().lstrip("@")
+        for domain in VENDORS.get(vendor_id, {}).get("domains", [])
+    }
+    other_authorized = {
+        row["email"]
+        for row in c.execute(
+            "select email from vendor_email_addresses where vendor_id!=? "
+            "and authorization_status='AUTHORIZED'", (vendor_id,),
+        ).fetchall()
+    }
+    for row in c.execute(query, parameters).fetchall():
+        if not email_service.valid_email(row["email"]):
+            continue
+        if master and master != row["email"]:
+            continue
+        if row["email"].rsplit("@", 1)[1] not in configured_domains:
+            continue
+        if row["email"] in other_authorized:
+            continue
+        return dict(row)
+    return None
+
+
+def _update_run_email(c, run_id, email):
+    run = c.execute("select decision from runs where id=?", (run_id,)).fetchone()
+    if run:
+        decision = json.loads(run["decision"])
+        decision["vendor_email"] = email
+        c.execute("update runs set decision=? where id=?", (json.dumps(decision), run_id))
+
+
 async def _send_pending_email(notification_id):
     c = db.conn()
     attempted_at = time.time()
-    with c:
-        claimed = c.execute(
-            "update email_notifications set attempted_at=?,error=null "
-            "where id=? and status='PENDING' and attempted_at is null",
-            (attempted_at, notification_id),
-        ).rowcount
+    c.execute("begin immediate")
+    try:
         notification = c.execute(
             "select * from email_notifications where id=?", (notification_id,)
         ).fetchone()
-    if not notification:
+        if not notification:
+            c.rollback()
+            raise HTTPException(404, "Email notification not found")
+        if notification["status"] != "PENDING" or notification["attempted_at"] is not None:
+            c.rollback()
+            result = dict(notification)
+            c.close()
+            return result
+        try:
+            maximum = int(os.getenv("EMAIL_MAX_PER_HOUR", "5"))
+        except ValueError:
+            maximum = 0
+        attempted_recently = c.execute(
+            "select count(*) from email_notifications where attempted_at>=?",
+            (attempted_at - 3600,),
+        ).fetchone()[0]
+        if maximum < 1:
+            outbox_reason = "EMAIL_MAX_PER_HOUR must be a positive integer"
+        elif attempted_recently >= maximum:
+            outbox_reason = f"Hourly email limit reached (EMAIL_MAX_PER_HOUR={maximum})"
+        else:
+            outbox_reason = None
+        if outbox_reason:
+            c.execute(
+                "update email_notifications set status='OUTBOX',error=?,completed_at=? where id=?",
+                (outbox_reason, attempted_at, notification_id),
+            )
+            blocked_email = {
+                "notification_id": notification_id,
+                "recipient": notification["recipient"],
+                "recipient_source": notification["recipient_source"],
+                "recipient_note": notification["recipient_note"],
+                "subject": notification["subject"],
+                "body": notification["body"],
+                "status": "OUTBOX",
+                "error": outbox_reason,
+                "attempted_at": None,
+                "completed_at": attempted_at,
+            }
+            _update_run_email(c, notification["run_id"], blocked_email)
+            c.commit()
+            result = c.execute(
+                "select * from email_notifications where id=?", (notification_id,)
+            ).fetchone()
+            output = dict(result)
+            c.close()
+            return output
+        c.execute(
+            "update email_notifications set attempted_at=?,error=null "
+            "where id=? and status='PENDING' and attempted_at is null",
+            (attempted_at, notification_id),
+        )
+        c.commit()
+    except Exception:
+        if c.in_transaction:
+            c.rollback()
         c.close()
-        raise HTTPException(404, "Email notification not found")
-    if not claimed:
-        c.close()
-        return dict(notification)
+        raise
 
-    delivery = await asyncio.to_thread(
-        email_service.send_email,
-        notification["recipient"],
-        notification["subject"],
-        notification["body"],
-    )
-    completed_at = time.time()
-    with c:
-        c.execute(
-            "update email_notifications set recipient=?,status=?,error=?,completed_at=? where id=?",
-            (delivery["recipient"], delivery["status"], delivery["error"],
-             completed_at, notification_id),
+    try:
+        delivery = await asyncio.to_thread(
+            email_service.send_email,
+            notification["recipient"],
+            notification["subject"],
+            notification["body"],
         )
-        c.execute(
-            "insert into vendor_emails(run_id,vendor_id,recipient,subject,body,status,error,attempted_at,completed_at) "
-            "values(?,?,?,?,?,?,?,?,?) on conflict(run_id) do update set "
-            "recipient=excluded.recipient,subject=excluded.subject,body=excluded.body,"
-            "status=excluded.status,error=excluded.error,attempted_at=excluded.attempted_at,"
-            "completed_at=excluded.completed_at",
-            (notification["run_id"], notification["vendor_id"], delivery["recipient"],
-             notification["subject"], notification["body"], delivery["status"],
-             delivery["error"], attempted_at, completed_at),
-        )
-        run = c.execute("select decision from runs where id=?",
-                        (notification["run_id"],)).fetchone()
-        if run:
-            decision = json.loads(run["decision"])
-            decision["vendor_email"] = {
+        completed_at = time.time()
+        with c:
+            c.execute(
+                "update email_notifications set recipient=?,status=?,error=?,completed_at=? where id=?",
+                (delivery["recipient"], delivery["status"], delivery["error"],
+                 completed_at, notification_id),
+            )
+            c.execute(
+                "insert into vendor_emails(run_id,vendor_id,recipient,subject,body,status,error,attempted_at,completed_at) "
+                "values(?,?,?,?,?,?,?,?,?) on conflict(run_id) do update set "
+                "recipient=excluded.recipient,subject=excluded.subject,body=excluded.body,"
+                "status=excluded.status,error=excluded.error,attempted_at=excluded.attempted_at,"
+                "completed_at=excluded.completed_at",
+                (notification["run_id"], notification["vendor_id"], delivery["recipient"],
+                 notification["subject"], notification["body"], delivery["status"],
+                 delivery["error"], attempted_at, completed_at),
+            )
+            _update_run_email(c, notification["run_id"], {
                 "notification_id": notification_id,
                 "recipient": delivery["recipient"],
+                "recipient_source": notification["recipient_source"],
+                "recipient_note": notification["recipient_note"],
                 "subject": notification["subject"],
                 "body": notification["body"],
                 "status": delivery["status"],
                 "error": delivery["error"],
                 "attempted_at": attempted_at,
                 "completed_at": completed_at,
-            }
-            c.execute("update runs set decision=? where id=?",
-                      (json.dumps(decision), notification["run_id"]))
-    result = c.execute(
-        "select id,recipient,subject,status,error,created_at,attempted_at,completed_at "
-        "from email_notifications where id=?", (notification_id,)
-    ).fetchone()
-    c.close()
-    return dict(result)
+            })
+        result = c.execute(
+            "select id,recipient,recipient_source,recipient_note,subject,status,error,"
+            "created_at,attempted_at,completed_at "
+            "from email_notifications where id=?", (notification_id,)
+        ).fetchone()
+        return dict(result)
+    finally:
+        c.close()
 
 
 async def pipeline(
@@ -206,8 +465,11 @@ async def _pipeline_run(
             ex, extractor_name = await extract.extract(data, mime)
         else:
             ex, extractor_name = sample, "sample fixture"
-    except Exception as e:
-        yield S("Extract", "error", str(e)); yield ev(type="error", message=str(e)); return
+    except Exception:
+        message = "Extraction failed. Verify extractor configuration and retry."
+        yield S("Extract", "error", message)
+        yield ev(type="error", message=message)
+        return
     await asyncio.sleep(0.3)
     yield S("Extract", "done", f"Extractor: {extractor_name} | {ex.get('vendor_name')}, invoice {ex.get('invoice_number')}, total {ex.get('total')}", int((time.time() - t) * 1000))
 
@@ -226,6 +488,9 @@ async def _pipeline_run(
     yield S("Match vendor", "running"); await asyncio.sleep(0.3)
     vid, vscore = rules.match_vendor(ex.get("vendor_name"))
     vcheck = rules.vendor_check(vid, vscore, ex.get("vendor_name"))
+    registered_email = (
+        _register_vendor_email(c, vid, vscore, ex, fh) if vid else None
+    )
     row = c.execute("select points from trust where vendor_id=?", (vid,)).fetchone() if vid else None
     pts = row["points"] if row else 0
     yield S("Match vendor", "done", vcheck["detail"] + (f" | trust {pts}/{TRUST_THRESHOLD}" if vid else ""))
@@ -259,41 +524,89 @@ async def _pipeline_run(
     notification_id = None
     send_email = False
     if email:
-        issues = email_service.critical_field_issues(ex)
-        content = email_service.build_information_request(
-            ex.get("vendor_name"), ex, issues
+        has_hard_stop = bool(d.get("hard_stops")) or any(
+            check.get("hard") and check.get("status") == "fail"
+            for check in d.get("checks", [])
         )
-        recipient_row = c.execute(
-            "select email from vendors where vendor_id=?", (vid,)
-        ).fetchone() if vid else None
-        recipient = recipient_row["email"] if recipient_row else None
-        key = email_service.notification_key(vid, ex, fh, issues)
-        existing = c.execute(
-            "select id,recipient,subject,body,status,error,created_at,attempted_at,completed_at "
-            "from email_notifications where notification_key=? order by id desc limit 1", (key,)
-        ).fetchone()
-        email.update(content)
-        if existing:
-            notification_id = existing["id"]
-            email.update(
-                notification_id=notification_id,
-                recipient=existing["recipient"],
-                status=existing["status"],
-                error=existing["error"],
-                duplicate_prevented=True,
-                attempted_at=existing["attempted_at"],
-                completed_at=existing["completed_at"],
-            )
+        if d["action"] != "HOLD_FOR_INFO" or not vid or has_hard_stop:
+            email = None
+            d["vendor_email"] = None
         else:
-            can_send, draft_reason = email_service.delivery_eligibility(recipient)
+            issues = email_service.critical_field_issues(ex)
+            content = email_service.build_information_request(
+                ex.get("vendor_name"), ex, issues
+            )
+            recipient_row = c.execute(
+                "select email from vendors where vendor_id=?", (vid,)
+            ).fetchone()
+            master_contact = recipient_row["email"] if recipient_row else None
+            invoice_email = ex.get("vendor_email")
+            dynamic_authorized = bool(
+                registered_email
+                and registered_email["authorization_status"] == "AUTHORIZED"
+            )
+            if not invoice_email and not ex.get("vendor_email_invalid"):
+                trusted_email = _authorized_vendor_email(
+                    c, vid, master_contact=master_contact
+                )
+                if trusted_email:
+                    invoice_email = trusted_email["email"]
+                    dynamic_authorized = True
+            selection = email_service.select_recipient(
+                master_contact,
+                invoice_email,
+                VENDORS.get(vid, {}).get("domains", []) if dynamic_authorized else [],
+                dynamically_authorized=dynamic_authorized,
+            )
+            can_send, draft_reason = email_service.delivery_eligibility(
+                selection["recipient"],
+                allowlisted=selection["allowlisted"],
+                invoice_domain_verified=selection["invoice_domain_verified"],
+            )
+            if not can_send and registered_email and registered_email["authorization_status"] != "AUTHORIZED":
+                draft_reason = (
+                    f"{draft_reason}; extracted invoice address not authorized: "
+                    f"{registered_email['authorization_reason']}"
+                )
+            if ex.get("vendor_email_invalid"):
+                invalid_reason = "The extracted invoice email is invalid."
+                draft_reason = f"{draft_reason}; {invalid_reason}" if not can_send else draft_reason
+            email.update(content)
             email.update(
-                recipient=recipient or None,
+                recipient=selection["recipient"],
+                recipient_source=selection["recipient_source"],
+                recipient_note=selection["recipient_note"],
                 status="PENDING" if can_send else "OUTBOX",
                 error=None if can_send else draft_reason,
                 attempted_at=None,
                 completed_at=None,
             )
-            send_email = can_send
+            key = email_service.notification_key(
+                vid, ex, fh, issues,
+                selection["recipient"] or ex.get("vendor_email"),
+            )
+            existing = c.execute(
+                "select id,recipient,recipient_source,recipient_note,subject,body,status,error,"
+                "created_at,attempted_at,completed_at "
+                "from email_notifications where notification_key=? "
+                "and status in ('SENT','PENDING') order by id desc limit 1",
+                (key,),
+            ).fetchone()
+            if existing:
+                notification_id = existing["id"]
+                email.update(
+                    notification_id=notification_id,
+                    recipient=existing["recipient"],
+                    recipient_source=existing["recipient_source"],
+                    recipient_note=existing["recipient_note"],
+                    status=existing["status"],
+                    error=existing["error"],
+                    duplicate_prevented=True,
+                    attempted_at=existing["attempted_at"],
+                    completed_at=existing["completed_at"],
+                )
+            else:
+                send_email = can_send
     c.execute(
         "insert into runs"
         "(id,created_at,filename,source,file_hash,vendor_id,po_id,invoice_number,invoice_date,total,"
@@ -305,34 +618,23 @@ async def _pipeline_run(
          original_run_id),
     )
     if email and (send_email or email.get("status") == "OUTBOX"):
-        key = email_service.notification_key(vid, ex, fh, issues)
+        attempt_number = c.execute(
+            "select coalesce(max(attempt_number),0)+1 from email_notifications "
+            "where notification_key=?",
+            (key,),
+        ).fetchone()[0]
         inserted = c.execute(
-            "insert or ignore into email_notifications"
-            "(run_id,vendor_id,dedupe_key,notification_key,attempt_number,recipient,subject,body,status,error,created_at) "
-            "values(?,?,?,?,?,?,?,?,?,?,?)",
-            (run_id, vid, f"{key}:1", key, 1, email["recipient"], email["subject"], email["body"],
-             email["status"], email["error"], time.time()),
+            "insert into email_notifications"
+            "(run_id,vendor_id,dedupe_key,notification_key,attempt_number,recipient,subject,body,"
+            "recipient_source,recipient_note,status,error,created_at) "
+            "values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, vid, f"{key}:{attempt_number}", key, attempt_number,
+             email["recipient"], email["subject"], email["body"],
+             email["recipient_source"], email["recipient_note"], email["status"],
+             email["error"], time.time()),
         )
-        if inserted.rowcount:
-            notification_id = inserted.lastrowid
-            email["notification_id"] = notification_id
-        else:
-            existing = c.execute(
-                "select id,recipient,status,error,attempted_at,completed_at "
-                "from email_notifications where notification_key=? order by id desc limit 1", (key,)
-            ).fetchone()
-            notification_id = existing["id"]
-            email.update(
-                notification_id=notification_id,
-                recipient=existing["recipient"],
-                status=existing["status"],
-                error=existing["error"],
-                duplicate_prevented=True,
-                attempted_at=existing["attempted_at"],
-                completed_at=existing["completed_at"],
-            )
-            send_email = False
-            c.execute("update runs set decision=? where id=?", (json.dumps(d), run_id))
+        notification_id = inserted.lastrowid
+        email["notification_id"] = notification_id
     c.commit()
     yield S("Decide", "done", f"{d['action']} (confidence {d['confidence']})")
     if email and send_email:
@@ -343,6 +645,8 @@ async def _pipeline_run(
         c.commit()
         if delivery["status"] == "SENT":
             yield S("Email vendor", "done", f"SMTP server accepted the email to {delivery['recipient']}")
+        elif delivery["status"] == "OUTBOX":
+            yield S("Email vendor", "done", delivery["error"] or "Email saved to outbox")
         else:
             yield S("Email vendor", "error", f"Email failed: {delivery['error']}")
     elif email:
@@ -394,7 +698,8 @@ def samples(): return [dict(key=k, label=v["label"]) for k, v in SAMPLES.items()
 class Review(BaseModel): verdict: str
 
 @app.post("/api/runs/{rid}/review")
-def review(rid: str, body: Review):
+def review(rid: str, body: Review, request: Request):
+    _require_admin(request)
     c = db.conn()
     r = c.execute("select * from runs where id=?", (rid,)).fetchone()
     if not r: raise HTTPException(404)
@@ -520,7 +825,8 @@ def run_detail(rid: str):
 
 
 @app.post("/api/runs/{rid}/emails/{email_id}/resend")
-async def resend_email(rid: str, email_id: int):
+async def resend_email(rid: str, email_id: int, request: Request):
+    _require_admin(request)
     c = db.conn()
     try:
         with c:
@@ -532,6 +838,22 @@ async def resend_email(rid: str, email_id: int):
                 raise HTTPException(404, "Email notification not found")
             if notification["status"] != "FAILED":
                 raise HTTPException(409, "Only failed email notifications can be resent")
+            run = c.execute(
+                "select action,vendor_id,decision from runs where id=?", (rid,)
+            ).fetchone()
+            if not run:
+                raise HTTPException(404, "Invoice run not found")
+            decision = json.loads(run["decision"])
+            if (
+                run["action"] != "HOLD_FOR_INFO"
+                or not run["vendor_id"]
+                or decision.get("hard_stops")
+                or any(
+                    check.get("hard") and check.get("status") == "fail"
+                    for check in decision.get("checks", [])
+                )
+            ):
+                raise HTTPException(409, "Email resend is only allowed for a held invoice without hard stops")
             claimed = c.execute(
                 "update email_notifications set resend_claimed_at=? "
                 "where id=? and status='FAILED' and resend_claimed_at is null",
@@ -547,17 +869,67 @@ async def resend_email(rid: str, email_id: int):
                 "select email from vendors where vendor_id=?",
                 (notification["vendor_id"],),
             ).fetchone()
-            recipient = vendor_contact["email"] if vendor_contact else notification["recipient"]
+            master_contact = vendor_contact["email"] if vendor_contact else None
+            invoice_email = (decision.get("invoice") or {}).get("vendor_email")
+            dynamic_record = _authorized_vendor_email(
+                c, notification["vendor_id"],
+                address=invoice_email if invoice_email else None,
+                master_contact=master_contact,
+            )
+            if not invoice_email:
+                dynamic_record = _authorized_vendor_email(
+                    c, notification["vendor_id"], master_contact=master_contact
+                )
+                if dynamic_record:
+                    invoice_email = dynamic_record["email"]
+            selection = email_service.select_recipient(
+                master_contact,
+                invoice_email,
+                VENDORS.get(run["vendor_id"], {}).get("domains", [])
+                if dynamic_record else [],
+                dynamically_authorized=bool(dynamic_record),
+            )
+            can_send, draft_reason = email_service.delivery_eligibility(
+                selection["recipient"],
+                allowlisted=selection["allowlisted"],
+                invoice_domain_verified=selection["invoice_domain_verified"],
+                is_resend=True,
+            )
+            retry_status = "PENDING" if can_send else "OUTBOX"
             retry = c.execute(
                 "insert into email_notifications"
-                "(run_id,vendor_id,dedupe_key,notification_key,attempt_number,recipient,subject,body,status,created_at) "
-                "values(?,?,?,?,?,?,?,?,?,?)",
+                "(run_id,vendor_id,dedupe_key,notification_key,attempt_number,recipient,subject,body,"
+                "recipient_source,recipient_note,status,error,created_at) "
+                "values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rid, notification["vendor_id"],
                  f"{notification['notification_key']}:{attempt}",
-                 notification["notification_key"], attempt, recipient,
-                 notification["subject"], notification["body"], "PENDING", time.time()),
+                 notification["notification_key"], attempt, selection["recipient"],
+                 notification["subject"], notification["body"], selection["recipient_source"],
+                 selection["recipient_note"], retry_status,
+                 None if can_send else draft_reason, time.time()),
             )
             retry_id = retry.lastrowid
+            if not can_send:
+                decision["vendor_email"] = {
+                    "notification_id": retry_id,
+                    "recipient": selection["recipient"],
+                    "recipient_source": selection["recipient_source"],
+                    "recipient_note": selection["recipient_note"],
+                    "subject": notification["subject"],
+                    "body": notification["body"],
+                    "status": "OUTBOX",
+                    "error": draft_reason,
+                    "attempted_at": None,
+                    "completed_at": time.time(),
+                }
+                c.execute("update runs set decision=? where id=?", (json.dumps(decision), rid))
+        if not can_send:
+            result = c.execute(
+                "select id,recipient,recipient_source,recipient_note,subject,status,error,"
+                "created_at,attempted_at,completed_at from email_notifications where id=?",
+                (retry_id,),
+            ).fetchone()
+            return dict(result)
     finally:
         c.close()
     result = await _send_pending_email(retry_id)
@@ -570,9 +942,17 @@ def vendors():
     try:
         t = {r["vendor_id"]: r for r in c.execute("select * from trust").fetchall()}
         emails = {r["vendor_id"]: r["email"] for r in c.execute("select vendor_id,email from vendors")}
+        email_addresses = {}
+        for row in c.execute(
+            "select vendor_id,email,source_invoice_hash,extraction_confidence,"
+            "authorization_status,authorization_reason,created_at,updated_at "
+            "from vendor_email_addresses order by updated_at desc,id desc"
+        ):
+            email_addresses.setdefault(row["vendor_id"], []).append(dict(row))
         return [dict(id=k, name=v["name"], email=emails.get(k, ""), points=t[k]["points"] if k in t else 0,
                      confirms=t[k]["confirms"] if k in t else 0,
-                     overrides=t[k]["overrides"] if k in t else 0, threshold=TRUST_THRESHOLD) for k, v in VENDORS.items()]
+                     overrides=t[k]["overrides"] if k in t else 0, threshold=TRUST_THRESHOLD,
+                     email_addresses=email_addresses.get(k, [])) for k, v in VENDORS.items()]
     finally:
         c.close()
 
@@ -670,6 +1050,13 @@ def analytics(date_from: str = None, date_to: str = None, vendor_id: str = None,
                  conn.execute("select vendor_id,points from trust").fetchall()}
         vendor_emails = {row["vendor_id"]: row["email"] for row in
                          conn.execute("select vendor_id,email from vendors").fetchall()}
+        vendor_email_addresses = {}
+        for row in conn.execute(
+            "select vendor_id,email,source_invoice_hash,extraction_confidence,"
+            "authorization_status,authorization_reason,created_at,updated_at "
+            "from vendor_email_addresses order by updated_at desc,id desc"
+        ):
+            vendor_email_addresses.setdefault(row["vendor_id"], []).append(dict(row))
     finally:
         conn.close()
     vendor_filter = [vendor_id] if vendor_id else list(VENDORS)
@@ -691,6 +1078,7 @@ def analytics(date_from: str = None, date_to: str = None, vendor_id: str = None,
             "trust_threshold": TRUST_THRESHOLD,
             "automation_eligible": vendor["active"] and trust.get(vid, 0) >= TRUST_THRESHOLD,
             "email": vendor_emails.get(vid, ""),
+            "email_addresses": vendor_email_addresses.get(vid, []),
         })
     return {
         "filters": {
@@ -753,7 +1141,8 @@ def email_history(date_from: str = None, date_to: str = None, vendor_id: str = N
     c = db.conn()
     try:
         rows = c.execute(
-            "select e.id,e.run_id,e.vendor_id,e.recipient,e.subject,e.body,e.status,e.error,"
+            "select e.id,e.run_id,e.vendor_id,e.recipient,e.recipient_source,e.recipient_note,"
+            "e.subject,e.body,e.status,e.error,"
             "e.created_at,e.attempted_at,e.completed_at,r.invoice_number,r.po_id,r.total,"
             "coalesce(v.name,'Unknown') vendor,r.action,r.status invoice_status "
             "from email_notifications e join runs r on r.id=e.run_id "
@@ -770,6 +1159,10 @@ def email_history(date_from: str = None, date_to: str = None, vendor_id: str = N
 def reset(request: Request):
     _require_admin(request)
     c = db.conn()
+    c.execute(
+        "delete from vendor_email_addresses where source_invoice_hash in "
+        "(select file_hash from runs where source!='seeded')"
+    )
     c.execute("delete from vendor_emails where run_id in (select id from runs where source!='seeded')")
     c.execute("delete from email_notifications where run_id in (select id from runs where source!='seeded')")
     c.execute("delete from runs where source!='seeded'")
@@ -957,9 +1350,8 @@ LIVE = []
 async def live_run(name, data, mime, source, sender=None):
     async for l in pipeline(name, data, mime, source, sender=sender): LIVE.append(json.loads(l))
 
-@app.post("/api/inbound/{token}")
-async def inbound(token: str, req: Request):
-    if token != os.getenv("INBOUND_TOKEN", "dev-token"): raise HTTPException(403)
+async def _process_inbound(req: Request):
+    _require_inbound(req)
     p = await req.json()
     ok = [a for a in p.get("Attachments", []) if a.get("ContentType") in MIMES][:3]
     for a in ok:
@@ -979,6 +1371,12 @@ async def inbound(token: str, req: Request):
             )
         )
     return dict(queued=len(ok))
+
+
+@app.post("/api/inbound")
+async def inbound(req: Request):
+    return await _process_inbound(req)
+
 
 @app.get("/api/live")
 def live(after: int = 0): return dict(events=LIVE[after:], cursor=len(LIVE))

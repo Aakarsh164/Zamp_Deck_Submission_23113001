@@ -11,12 +11,20 @@ import pymupdf
 from PIL import Image
 
 
+EMAIL_PATTERN = re.compile(
+    r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+"
+    r"[A-Z]{2,63}",
+    re.I,
+)
+
 PROMPT = """You extract data from vendor invoices. Return ONLY one JSON object, no prose, with keys:
-vendor_name, invoice_number, invoice_date (YYYY-MM-DD), po_reference, currency,
+vendor_name, vendor_email (the vendor's billing/accounts contact printed on the invoice, or null),
+invoice_number, invoice_date (YYYY-MM-DD), po_reference, currency,
 line_items [{description, quantity, unit_price, amount}], subtotal, tax,
 tax_included (true only if prices already include tax), total,
 bank_last4 (last 4 digits of any bank account or IBAN shown),
-confidence {vendor_name, invoice_number, invoice_date, total} (0 to 1 each),
+confidence {vendor_name, vendor_email, invoice_number, invoice_date, total} (0 to 1 each),
 evidence {field: short verbatim snippet from the document}.
 Rules: use null for anything not clearly present. Never guess or compute a missing value.
 Numbers are plain numbers with no currency symbols."""
@@ -200,6 +208,8 @@ async def _local(data, mime):
         return m
     num = lambda s: float(s.replace(",", ""))
     m = g("invoice_number", r"invoice\s*(?:no\.?|number|#)?[:\s]*([A-Z0-9][\w-]*\d[\w-]*)"); inv = m.group(1) if m else None
+    email_match = EMAIL_PATTERN.search(text)
+    vendor_email = _normalize_email(email_match.group(0)) if email_match else None
     m = re.search(r"date[:\s]*(.+)", text, re.I); d = (_date(m.group(1)) if m else None) or _date(text)
     m = g("po_reference", r"\bPO[-\s]?(\d{3,})", 0); po = "PO-" + m.group(1) if m else None
     tots = list(re.finditer(r"\btotal[^\d\n]{0,20}([\d,]+(?:\.\d{2})?)", text, re.I))
@@ -212,9 +222,10 @@ async def _local(data, mime):
     if sub is None and total is not None: sub = total if incl else round(total - (tax or 0), 2)
     m = g("bank_last4", r"(?:account|a/c|iban)[^\n]*?(\d{4})\s*$"); bank = m.group(1) if m else None
     c = lambda v: 0.85 if v not in (None, "") else 0.0
-    return dict(vendor_name=lines[0], invoice_number=inv, invoice_date=d, po_reference=po, currency="USD", line_items=[],
+    return dict(vendor_name=lines[0], vendor_email=vendor_email, invoice_number=inv, invoice_date=d, po_reference=po, currency="USD", line_items=[],
                 subtotal=sub, tax=tax, tax_included=incl, total=total, bank_last4=bank,
-                confidence=dict(vendor_name=.85, invoice_number=c(inv), invoice_date=c(d), total=c(total)), evidence=ev)
+                confidence=dict(vendor_name=.85, vendor_email=.99 if vendor_email else 0.0,
+                                invoice_number=c(inv), invoice_date=c(d), total=c(total)), evidence=ev)
 
 
 def _number(value):
@@ -238,6 +249,15 @@ def _number(value):
 
 def _text(value):
     return value.strip() or None if isinstance(value, str) else None
+
+
+def _normalize_email(value):
+    if not isinstance(value, str):
+        return None
+    address = value.strip()
+    if not EMAIL_PATTERN.fullmatch(address):
+        return None
+    return address.lower()
 
 
 def _normalise_date(value):
@@ -275,7 +295,7 @@ def _normalise_result(result):
         confidence = {}
     confidence = {
         key: (value if value is not None and 0 <= value <= 1 else None)
-        for key in ("vendor_name", "invoice_number", "invoice_date", "total")
+        for key in ("vendor_name", "vendor_email", "invoice_number", "invoice_date", "total")
         for value in [_number(confidence.get(key))]
     }
 
@@ -290,8 +310,12 @@ def _normalise_result(result):
     else:
         bank_last4 = _text(bank_last4)
 
+    raw_vendor_email = result.get("vendor_email")
+    normalized_vendor_email = _normalize_email(raw_vendor_email)
     return {
         "vendor_name": _text(result.get("vendor_name")),
+        "vendor_email": normalized_vendor_email,
+        "vendor_email_invalid": bool(raw_vendor_email and not normalized_vendor_email),
         "invoice_number": _text(result.get("invoice_number")),
         "invoice_date": _normalise_date(result.get("invoice_date")),
         "po_reference": _text(result.get("po_reference")),

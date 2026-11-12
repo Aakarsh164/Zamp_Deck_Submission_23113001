@@ -54,9 +54,6 @@ ul{margin:6px 0;padding-left:20px}
  <div class="card"><h2>Run an invoice</h2>
   <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.webp" aria-label="Invoice file">
   <p><button class="pri" id="go">Run invoice</button></p>
-  <label class="admin-token-label">Admin token (deployed instances only)
-   <input type="password" id="adminToken" autocomplete="off" placeholder="Optional">
-  </label>
   <h2>Or try a sample</h2><div class="samples" id="samples"></div>
   <p><button id="reset">Reset demo data</button></p></div>
  <div class="card"><h2>Rule proposals</h2><div id="props" class="mut">None yet.</div></div>
@@ -82,8 +79,8 @@ ul{margin:6px 0;padding-left:20px}
  <div class="card"><h2>Run history</h2><table><thead><tr><th>Invoice</th><th>Vendor</th><th>PO</th><th>Total</th><th>Action</th><th>Status</th><th>Email</th></tr></thead><tbody id="runs"></tbody></table></div>
 </section>
 <section id="invoices" class="page-view tab-page" hidden><div class="card"><h2>Invoices</h2><div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Vendor</th><th>PO</th><th>Amount</th><th>Decision</th><th>Status</th><th>Email</th><th>Processed</th></tr></thead><tbody id="invoiceRows"></tbody></table></div></div></section>
-<section id="vendors-page" class="page-view tab-page" hidden><div class="card"><h2>Vendor performance</h2><div class="table-wrap"><table><thead><tr><th>Vendor</th><th>Email contact</th><th>Invoices</th><th>Approved</th><th>Rejected</th><th>Escalated</th><th>Trust</th><th>Value</th><th>Automation</th></tr></thead><tbody id="vendorPerformance"></tbody></table></div></div></section>
-<section id="email-page" class="page-view tab-page" hidden><div class="card"><h2>Vendor email history</h2><div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Vendor</th><th>Recipient</th><th>Subject</th><th>Status</th><th>Time</th><th>Message / status detail</th><th></th></tr></thead><tbody id="emailRows"></tbody></table></div></div></section>
+<section id="vendors-page" class="page-view tab-page" hidden><div class="card"><h2>Vendor performance</h2><div class="table-wrap"><table><thead><tr><th>Vendor</th><th>Vendor contacts and extracted addresses</th><th>Invoices</th><th>Approved</th><th>Rejected</th><th>Escalated</th><th>Trust</th><th>Value</th><th>Automation</th></tr></thead><tbody id="vendorPerformance"></tbody></table></div></div></section>
+<section id="email-page" class="page-view tab-page" hidden><div class="card"><h2>Vendor email history</h2><div class="table-wrap"><table><thead><tr><th>Invoice</th><th>Vendor</th><th>Recipient</th><th>Chosen by</th><th>Subject</th><th>Status</th><th>Time</th><th>Message / status detail</th><th></th></tr></thead><tbody id="emailRows"></tbody></table></div></div></section>
 <section id="analytics-page" class="page-view tab-page" hidden>
  <div class="chart-grid">
   <div class="card"><h2>Decision distribution</h2><div id="chart-decisions"></div></div>

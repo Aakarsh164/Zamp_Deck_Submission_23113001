@@ -1,4 +1,4 @@
-"""Verify the deployed app's public demo paths with only the Python standard library."""
+"""Verify the deployed app's authenticated demo paths with only the Python standard library."""
 import argparse
 import json
 import os
@@ -16,6 +16,13 @@ API_KEYS = ("GEMINI_API_KEY", "GROQ_API_KEY", "ANTHROPIC_API_KEY")
 
 class SmokeTestError(RuntimeError):
     pass
+
+
+def admin_headers(headers=None):
+    token = os.getenv("ADMIN_TOKEN", "")
+    if not token:
+        raise SmokeTestError("Set ADMIN_TOKEN in this process to authenticate smoke-test requests")
+    return {**(headers or {}), "X-Admin-Token": token}
 
 
 def request(base_url, path, data=None, headers=None, timeout=180):
@@ -51,7 +58,7 @@ def check_public_paths(base_url):
     require(status == 200 and b"Forward-to-Decide" in body, "Home page check failed")
     print("PASS home page")
 
-    status, body = request(base_url, "/api/samples")
+    status, body = request(base_url, "/api/samples", headers=admin_headers())
     samples = json.loads(body)
     require(status == 200 and any(sample.get("key") == "clean" for sample in samples),
             "Samples endpoint did not include the clean sample")
@@ -59,6 +66,7 @@ def check_public_paths(base_url):
 
     status, body = request(base_url, "/api/gauntlet", data=b"", headers={
         "Content-Type": "application/json",
+        **admin_headers(),
     })
     result = json.loads(body)
     require(status == 200 and result.get("total", 0) > 0
@@ -68,6 +76,7 @@ def check_public_paths(base_url):
 
     status, body = request(base_url, "/api/sample/clean", data=b"", headers={
         "Content-Type": "application/x-www-form-urlencoded",
+        **admin_headers(),
     })
     events = read_events(body, "/api/sample/clean")
     decision = next((event for event in events if event.get("type") == "decision"), None)
@@ -92,7 +101,9 @@ def check_real_pdf_upload(base_url):
         base_url,
         "/api/run",
         data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        headers=admin_headers({
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        }),
     )
     events = read_events(response_body, "/api/run")
     decision = next((event for event in events if event.get("type") == "decision"), None)

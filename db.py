@@ -2,12 +2,24 @@ import json
 import os
 import sqlite3
 import time
+from pathlib import Path
 
 from data import VENDORS
 
-DB = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "app.db"))
+_configured_db = os.getenv("DB_PATH")
+DB = (
+    ":memory:"
+    if _configured_db == ":memory:"
+    else os.path.abspath(
+        os.path.expanduser(
+            _configured_db or os.path.join(os.path.dirname(__file__), "app.db")
+        )
+    )
+)
 
 def conn():
+    if DB != ":memory:":
+        Path(DB).expanduser().parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     c.execute("pragma busy_timeout=5000")
@@ -35,11 +47,19 @@ def _init_schema(c):
             status text not null, error text, attempted_at real not null, completed_at real);
         create table if not exists vendors(
             vendor_id text primary key, name text not null, email text not null default '');
+        create table if not exists vendor_email_addresses(
+            id integer primary key autoincrement, vendor_id text not null, email text not null,
+            source_invoice_hash text not null, extraction_confidence real,
+            authorization_status text not null
+                check(authorization_status in ('AUTHORIZED','PENDING_REVIEW')),
+            authorization_reason text not null, created_at real not null, updated_at real not null,
+            unique(vendor_id,email));
         create table if not exists email_notifications(
             id integer primary key autoincrement, run_id text not null, vendor_id text,
             dedupe_key text not null unique, notification_key text not null,
             attempt_number integer not null default 1, resend_claimed_at real,
             recipient text, subject text not null, body text not null,
+            recipient_source text, recipient_note text,
             status text not null check(status in ('SENT','FAILED','PENDING','OUTBOX','NOT_REQUIRED')),
             error text, created_at real not null, attempted_at real, completed_at real);
         create table if not exists processing_claims(
@@ -60,6 +80,8 @@ def _init_schema(c):
             ("notification_key", "text"),
             ("attempt_number", "integer not null default 1"),
             ("resend_claimed_at", "real"),
+            ("recipient_source", "text"),
+            ("recipient_note", "text"),
         )
         for column, definition in migrations:
             if column not in columns:
@@ -85,14 +107,15 @@ def _init_schema(c):
                     dedupe_key text not null unique, notification_key text not null,
                     attempt_number integer not null default 1, resend_claimed_at real,
                     recipient text, subject text not null, body text not null,
+                    recipient_source text, recipient_note text,
                     status text not null check(status in ('SENT','FAILED','PENDING','OUTBOX','NOT_REQUIRED')),
                     error text, created_at real not null, attempted_at real, completed_at real)
             """)
             c.execute("""
                 insert into email_notifications
                 select id,run_id,vendor_id,dedupe_key,notification_key,attempt_number,
-                    resend_claimed_at,recipient,subject,body,status,error,created_at,
-                    attempted_at,completed_at
+                    resend_claimed_at,recipient,subject,body,recipient_source,recipient_note,
+                    status,error,created_at,attempted_at,completed_at
                 from email_notifications_legacy
             """)
             c.execute("drop table email_notifications_legacy")
@@ -107,6 +130,10 @@ def _init_schema(c):
         c.execute(
             "create index if not exists email_notifications_status_idx "
             "on email_notifications(status, created_at)"
+        )
+        c.execute(
+            "create index if not exists vendor_email_addresses_vendor_idx "
+            "on vendor_email_addresses(vendor_id, authorization_status, updated_at)"
         )
         # Backfill known vendors and legacy .env contacts without overwriting
         # contacts already saved in the database.

@@ -12,19 +12,22 @@ let currentFilters = {};
 let liveCursor = 0;
 const stageRows = {};
 
+async function apiFetch(url, options) {
+  return fetch(url, options);
+}
+
 async function request(url, options) {
-  const response = await fetch(url, options);
+  const response = await apiFetch(url, options);
   if (!response.ok) {
     let message = "Request failed";
-    try { message = (await response.json()).detail || message; } catch (_) {}
+    if (response.status === 401 || response.status === 403) message = "This action is unavailable from this connection.";
+    else if (response.status >= 500) message = "The server could not complete this request.";
+    else {
+      try { message = (await response.json()).detail || message; } catch (_) {}
+    }
     throw new Error(message);
   }
   return response.json();
-}
-
-function adminHeaders(headers = {}) {
-  const token = $("adminToken").value.trim();
-  return token ? {...headers, "X-Admin-Token": token} : headers;
 }
 
 function filterQuery() {
@@ -177,7 +180,12 @@ function renderVendorPerformance(items) {
   $("vendorPerformance").innerHTML = items.map(vendor =>
     `<tr><td>${esc(vendor.vendor)}</td><td><form class="vendor-email-form" data-vendor-id="${esc(vendor.vendor_id)}">` +
     `<input aria-label="Email contact for ${esc(vendor.vendor)}" type="email" value="${esc(vendor.email)}" placeholder="Add vendor email">` +
-    `<button type="submit">Save</button></form></td><td>${vendor.total}</td><td>${vendor.approved}</td>` +
+    `<button type="submit">Save</button></form>` +
+    `${(vendor.email_addresses || []).map(address => `<div class="vendor-email-address" title="${esc(address.authorization_reason)}">` +
+      `<span>${esc(address.email)}</span> <span class="status-pill status-${address.authorization_status === "AUTHORIZED" ? "SENT" : "OUTBOX"}">${esc(address.authorization_status)}</span>` +
+      `<small>Invoice ${esc((address.source_invoice_hash || "").slice(0, 8))} · ${esc(dateTime(address.updated_at))}` +
+      `${address.extraction_confidence == null ? "" : ` · confidence ${Math.round(address.extraction_confidence * 100)}%`}</small></div>`).join("")}</td>` +
+    `<td>${vendor.total}</td><td>${vendor.approved}</td>` +
     `<td>${vendor.rejected}</td><td>${vendor.escalated}</td>` +
     `<td>${vendor.trust_score}/${vendor.trust_threshold}</td><td>${money(vendor.total_value)}</td>` +
     `<td>${vendor.automation_eligible ? "Eligible" : "Not eligible"}</td></tr>`
@@ -191,7 +199,7 @@ async function saveVendorEmail(event) {
   const email = form.querySelector("input").value.trim();
   try {
     await request(`/api/vendors/${encodeURIComponent(form.dataset.vendorId)}/email`, {
-      method: "PUT", headers: adminHeaders({"Content-Type": "application/json"}),
+      method: "PUT", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({email})
     });
     await refresh();
@@ -219,12 +227,14 @@ async function refresh() {
     ).join("") : '<tr><td colspan="7" class="mut">No invoices yet.</td></tr>';
     $("emailRows").innerHTML = history.length ? history.map(item =>
       `<tr><td class="click" data-invoice-id="${esc(item.run_id)}">${esc(item.invoice_number || "—")}</td>` +
-      `<td>${esc(item.vendor)}</td><td>${esc(item.recipient || "—")}</td><td>${esc(item.subject)}</td>` +
+      `<td>${esc(item.vendor)}</td><td>${esc(item.recipient || "—")}</td>` +
+      `<td>${esc(item.recipient_source || "—")}${item.recipient_note ? `<br><small>${esc(item.recipient_note)}</small>` : ""}</td>` +
+      `<td>${esc(item.subject)}</td>` +
       `<td><span class="status-pill status-${esc(item.status)}">${esc(item.status)}</span></td>` +
       `<td>${esc(dateTime(item.completed_at || item.created_at))}</td>` +
       `<td>${item.status === "OUTBOX" ? `<details><summary>${esc(item.error || "Drafted; not sent")}</summary><pre>${esc(item.body)}</pre></details>` : `<span class="failure">${esc(item.error || "")}</span>`}</td>` +
       `<td>${item.status === "FAILED" ? `<button data-resend="${item.run_id}:${item.id}">Resend</button>` : ""}</td></tr>`
-    ).join("") : '<tr><td colspan="8" class="mut">No email notifications match these filters.</td></tr>';
+    ).join("") : '<tr><td colspan="9" class="mut">No email notifications match these filters.</td></tr>';
     document.querySelectorAll("[data-invoice-id]").forEach(row =>
       row.onclick = () => openInvoice(row.dataset.invoiceId));
     document.querySelectorAll("[data-resend]").forEach(button =>
@@ -253,7 +263,8 @@ function showDecision(id, result) {
   ).join("");
   const history = result.email_history || [];
   const emailHistory = history.length ? history.map(item =>
-    `<div class="detail-email"><b>${esc(item.status)}</b> · ${esc(item.recipient || "No registered recipient")} · ${esc(dateTime(item.completed_at || item.created_at))}` +
+    `<div class="detail-email"><b>${esc(item.status)}</b> · ${esc(item.recipient || "No verified recipient")} · ${esc(item.recipient_source || "Recipient source unavailable")} · ${esc(dateTime(item.completed_at || item.created_at))}` +
+    `${item.recipient_note ? `<p>${esc(item.recipient_note)}</p>` : ""}` +
     `${item.error ? `<p class="failure">${esc(item.error)}</p>` : ""}` +
     `<p><b>${esc(item.subject)}</b></p><pre>${esc(item.body)}</pre>` +
     `${item.status === "FAILED" ? `<button onclick="resendEmail('${id}:${item.id}')">Resend email</button>` : ""}</div>`
@@ -267,7 +278,10 @@ function showDecision(id, result) {
     `<p>${esc(decision.decision_explanation || "")}</p><p><b>Why</b></p><ul>${(decision.reasons || []).map(reason => `<li>${esc(reason)}</li>`).join("")}</ul>` +
     `${decision.what_would_change_it?.length ? `<p><b>What would change it</b></p><ul>${decision.what_would_change_it.map(item => `<li>${esc(item)}</li>`).join("")}</ul>` : ""}` +
     `${email ? `<div class="detail-email"><b>Email status:</b> <span class="status-pill status-${esc(email.status)}">${esc(email.status)}</span>` +
-    `${email.recipient ? ` · ${esc(email.recipient)}` : ""}${email.duplicate_prevented ? " · duplicate notification prevented" : ""}` +
+    `${email.recipient ? ` · ${esc(email.recipient)}` : " · no verified recipient"}` +
+    `${email.recipient_source ? ` · chosen by ${esc(email.recipient_source)}` : ""}` +
+    `${email.recipient_note ? `<p>${esc(email.recipient_note)}</p>` : ""}` +
+    `${email.duplicate_prevented ? " · duplicate notification prevented" : ""}` +
     `${email.error ? `<p class="failure">${esc(email.error)}</p>` : ""}</div>` : ""}` +
     `<h3>Email history</h3>${emailHistory}` +
     `<div class="table-wrap"><table><thead><tr><th>Rule</th><th>Result</th><th>Detail</th></tr></thead><tbody>${checks}</tbody></table></div>` +
@@ -337,8 +351,15 @@ function handleEvent(event) {
 
 async function stream(url, options) {
   try {
-    const response = await fetch(url, options);
-    if (!response.ok) throw new Error((await response.json()).detail || "Request failed");
+    const response = await apiFetch(url, options);
+    if (!response.ok) {
+      const message = response.status === 401
+        ? "This action is unavailable from this connection."
+        : response.status === 403
+          ? "This action is unavailable from this connection."
+            : "The server could not complete this request.";
+      throw new Error(message);
+    }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -374,7 +395,7 @@ async function loadProps() {
 async function acceptProp(vendorId, tolerance) {
   try {
     await request("/api/proposals/accept", {
-      method: "POST", headers: adminHeaders({"Content-Type": "application/json"}),
+      method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({vendor_id: vendorId, tol: tolerance / 100})
     });
     await refresh();
@@ -386,7 +407,9 @@ async function pollLive() {
     const data = await request(`/api/live?after=${liveCursor}`);
     liveCursor = data.cursor;
     data.events.forEach(handleEvent);
-  } catch (error) { console.error("Live event polling failed:", error); }
+  } catch (error) {
+    console.error("Live event polling failed:", error);
+  }
 }
 
 async function initialize() {
@@ -427,7 +450,7 @@ $("go").onclick = () => {
 $("reset").onclick = async () => {
   if (!confirm("Reset demo invoices and trust data?")) return;
   try {
-    await request("/api/reset", {method: "POST", headers: adminHeaders()});
+    await request("/api/reset", {method: "POST"});
     $("stages").textContent = "Demo data cleared.";
     $("decision").hidden = true;
     await refresh();

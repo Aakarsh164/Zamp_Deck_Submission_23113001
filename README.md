@@ -53,8 +53,10 @@ python -m venv .venv
 .venv\Scripts\activate          # Mac/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 copy .env.example .env          # add a FREE GEMINI_API_KEY (samples work without any key)
-uvicorn main:app --reload       # http://127.0.0.1:8000
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
+
+Loopback requests from this local server (`127.0.0.1` or `::1`) do not need dashboard or inbound tokens. Requests from other hosts still require `ADMIN_TOKEN` or `INBOUND_TOKEN`. Keep the server bound to `127.0.0.1` for local work; do not bind this unauthenticated local workflow to a public or shared network. Restore and configure authentication before public or multi-user deployment.
 
 Run the unit, email, analytics, and decision-rule tests with:
 
@@ -72,13 +74,14 @@ Sample invoices and the Gauntlet need no key. For real uploads, get a free key a
 
 ### Vendor email requests
 
-`EMAIL_MODE` defaults to `demo`. For `HOLD_FOR_INFO` invoices, demo mode records the drafted request as `OUTBOX` with the message body in Email History; it never contacts SMTP. Missing vendor contacts remain visible as drafts, not delivery failures.
+`EMAIL_MODE` defaults to `demo`. For `HOLD_FOR_INFO` invoices only, the app selects the recipient in this order: a saved vendor-master contact, a statically allowlisted invoice address, an automatically authorized extracted address, or a previously authorized extracted address stored for that vendor. An extracted address is automatically authorized only when it is valid, vendor-name and email extraction confidence are each at least 90%, the vendor match score is at least 90%, its domain exactly matches the vendor's configured domains, and it conflicts with neither a saved vendor contact nor another vendor's address. The authorization reason, source invoice hash, extraction confidence, and timestamps are stored in SQLite and shown in the Vendors tab. Other extracted addresses remain pending review and are not trusted; their reason is included in Email History. A differing invoice address is noted when a saved vendor contact takes priority. No email is sent for escalations, auto-rejections, unknown vendors, or runs with hard stops.
 
-To enable outbound SMTP, set `EMAIL_MODE=smtp`, configure SMTP, and explicitly allow recipients with `EMAIL_ALLOWLIST` (comma-separated full email addresses). An empty allowlist sends nothing. SMTP sends only when configuration is complete and the recipient is allowlisted; otherwise the request stays in the outbox with a reason. Configure SMTP in the untracked local `.env` file:
+Demo mode records the draft and message in Email History but never contacts SMTP. To enable automatic outbound delivery, set `EMAIL_MODE=smtp` and configure SMTP. A recipient must be statically allowlisted or be an automatically authorized vendor address under the checks above; an empty allowlist alone authorizes no recipient. The existing static `EMAIL_ALLOWLIST` remains supported and is not modified by the app. `EMAIL_MODE=resend` disables initial automatic sends and allows only an explicit retry of a prior failed notification. Retries also require current recipient verification and configured SMTP. `EMAIL_MAX_PER_HOUR` is a global rolling-hour cap across initial sends and retries (default `5`); over-limit messages remain in `OUTBOX`. Failed SMTP attempts count toward the cap because each has already attempted delivery. Configure SMTP in the untracked local `.env` file:
 
 ```
 EMAIL_MODE=smtp
 EMAIL_ALLOWLIST=authorized-recipient@example.com
+EMAIL_MAX_PER_HOUR=5
 SMTP_HOST=smtp.example.com
 SMTP_PORT=587
 SMTP_USER=your-smtp-user
@@ -86,11 +89,17 @@ SMTP_PASSWORD=your-smtp-password
 SMTP_FROM_EMAIL=accounts@your-company.com
 ```
 
-SMTP uses STARTTLS. Set both `SMTP_USER` and `SMTP_PASSWORD` when authentication is required. `SMTP_FROM` and `SMTP_USERNAME` are accepted as aliases for older local configurations. Vendor contacts can alternatively be bootstrapped with a JSON `VENDOR_EMAILS` mapping in `.env`; the Vendors tab lets you maintain them in the database. Use only authorized contact addresses. Email statuses are `SENT`, `FAILED`, `PENDING`, `OUTBOX`, and `NOT_REQUIRED`; failed attempts include a reason and can be retried from Email History or invoice details. Notification history is append-only across retries, and reprocessing the same missing-information request does not send it again. `SENT` means the SMTP server accepted the message, not that it reached the vendor's inbox; delivery/bounce confirmation requires provider-side tracking. SMTP credentials are server-side only and are not returned by the API.
+SMTP uses STARTTLS on the configured port. Set both `SMTP_USER` and `SMTP_PASSWORD` when authentication is required. `SMTP_FROM` and `SMTP_USERNAME` are accepted as aliases for older local configurations. Vendor contacts can alternatively be bootstrapped with a JSON `VENDOR_EMAILS` mapping in `.env`; the Vendors tab lets you maintain them in the database. Use only authorized contact addresses. Email History and invoice details show the selected recipient and whether it came from the vendor master, static allowlist, or automatic vendor-email authorization. Email statuses are `SENT`, `FAILED`, `PENDING`, `OUTBOX`, and `NOT_REQUIRED`; failed attempts include the SMTP stage, exception type, and short error message, and can be retried from Email History or invoice details. Notification history is append-only across retries. A notification blocks a duplicate only while `SENT` or `PENDING`, and its identity includes the invoice file hash, selected recipient (or printed address when unverified), and sorted missing fields. Reprocessing the same missing-information request after it was sent does not send it again; failed and outbox records do not block a new attempt. `SENT` means the SMTP server accepted the message, not that it reached the vendor's inbox; delivery/bounce confirmation requires provider-side tracking. SMTP credentials are server-side only and are not returned by the API.
+
+To generate a local missing-information test invoice with a printed billing contact (no personal address is stored in the repository), set `TEST_VENDOR_EMAIL` in the shell before running `python make_test_pdfs.py`. For example, PowerShell uses `$env:TEST_VENDOR_EMAIL="contact@example.com"`; macOS/Linux uses `TEST_VENDOR_EMAIL=contact@example.com python make_test_pdfs.py`. The generated `5_missing_with_contact_email.pdf` has no invoice number or total. Use a test contact that is allowlisted or a domain configured for that vendor. Keep live SMTP tests under your control; the automated tests mock delivery.
 
 ### Public-demo safeguards
 
-Invoice uploads are limited to 5 MB and PDF, PNG, JPG, or WebP. The upload endpoint allows 10 requests per hour per client IP in memory and returns HTTP 429 when the limit is exceeded. Set `ADMIN_TOKEN` to protect reset, tolerance-proposal acceptance, and vendor-email updates; send it in the `X-Admin-Token` header or `admin_token` query parameter. When unset, these controls remain available locally. Run `python check_secrets.py` before publishing; it scans tracked files (or source files when the folder is not a Git checkout) for likely credentials without printing matched values. Keep `.env` out of source control.
+Invoice uploads are limited to 5 MB and PDF, PNG, JPG, or WebP. The upload endpoint allows 10 requests per hour per client IP in memory and returns HTTP 429 when the limit is exceeded.
+
+The dashboard and invoice-processing APIs are available without credentials only to loopback clients (`127.0.0.1` or `::1`), for local development. For any non-loopback client, `/api/inbound*` requires `INBOUND_TOKEN` via `X-Inbound-Token`, and other `/api/*` endpoints require `ADMIN_TOKEN` via `X-Admin-Token`. Missing configuration fails closed with HTTP 503; missing credentials return 401 and invalid credentials return 403. `/healthz` remains public. Keep Uvicorn bound to `127.0.0.1` for local use; authentication must be configured before public or multi-user deployment.
+
+Set `INBOUND_TOKEN` to a separate secret for forwarded invoices. Send it in the `X-Inbound-Token` header to `POST /api/inbound`; the token is never accepted from the URL. Missing configuration returns 503, missing credentials 401, and invalid credentials 403. Run `python check_secrets.py` before publishing; it scans tracked files (or source files when the folder is not a Git checkout) for likely credentials without printing matched values. Keep `.env` out of source control.
 
 ### Analytics dashboard
 
@@ -120,10 +129,10 @@ The backtest replays decisions with the recorded trust score and invoice evidenc
 
 ## Email ingestion
 
-`POST /api/inbound/<INBOUND_TOKEN>` accepts Postmark-style inbound JSON (`From`, `Attachments[{Name, ContentType, Content(base64)}]`). Point your inbound provider's webhook at it. The token in the URL stops strangers triggering runs. The UI polls `/api/live`, so forwarded invoices appear in the stage view with no page action. Test without any provider:
+`POST /api/inbound` accepts Postmark-style inbound JSON (`From`, `Attachments[{Name, ContentType, Content(base64)}]`). Point your inbound provider's webhook at it and configure the `X-Inbound-Token` request header. The dashboard's authenticated user can poll `/api/live` to see forwarded invoices. Test with your configured inbound header:
 
 ```
-curl -X POST http://127.0.0.1:8000/api/inbound/dev-token -H "Content-Type: application/json" -d "{\"From\":\"v@x.com\",\"Attachments\":[{\"Name\":\"a.pdf\",\"ContentType\":\"application/pdf\",\"Content\":\"<base64>\"}]}"
+curl -X POST http://127.0.0.1:8000/api/inbound -H "X-Inbound-Token: <configured-value>" -H "Content-Type: application/json" -d "{\"From\":\"v@x.com\",\"Attachments\":[{\"Name\":\"a.pdf\",\"ContentType\":\"application/pdf\",\"Content\":\"<base64>\"}]}"
 ```
 
 Other providers (Mailgun routes, a Cloudflare Email Worker) can post the same JSON shape.
@@ -134,10 +143,10 @@ For inbound invoices, R9 compares the sender domain with each vendor's `domains`
 
 1. Push the project to GitHub; `.env`, `app.db`, `.venv/`, and generated test invoices are excluded from source control and the Docker build context.
 2. In Render, create a **Web Service** from the repository and select **Docker** as the runtime. Set the health-check path to `/healthz`; the Docker command uses Render's `$PORT` (falling back to 8000 locally).
-3. Configure these environment variables in Render's dashboard: `EXTRACTOR=gemini`, `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-2.5-flash`, `INBOUND_TOKEN` (a unique secret), `ADMIN_TOKEN` (a unique secret), `EMAIL_MODE=demo`, and `AUDIT_EVERY=0` while recording the demo. To use Groq instead, set `EXTRACTOR=groq` and `GROQ_API_KEY`. Keep SMTP disabled for the public demo.
-4. After deploy, run `python smoke_test.py https://<your-render-service>.onrender.com`. It checks the health endpoint, home page, samples, Gauntlet, and clean sample path. If an extractor API key is configured in the environment running the script, it also uploads a generated test PDF and checks the extractor stage.
+3. Configure these environment variables in Render's dashboard: `EXTRACTOR=gemini`, `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-2.5-flash`, `INBOUND_TOKEN` (a unique secret), `ADMIN_TOKEN` (a separate unique secret), `EMAIL_MODE=demo`, and `AUDIT_EVERY=0` while recording the demo. Both authentication variables are required for their respective protected APIs. To use Groq instead, set `EXTRACTOR=groq` and `GROQ_API_KEY`. Keep SMTP disabled for the public demo.
+4. After deploy, run `python smoke_test.py https://<your-render-service>.onrender.com` with `ADMIN_TOKEN` set in the process environment. It checks the health endpoint, home page, samples, Gauntlet, and clean sample path. If an extractor API key is configured in the environment running the script, it also uploads a generated test PDF and checks the extractor stage. The script does not read `.env` or print the token.
 
-The runtime dependencies in `requirements.txt` are pinned. SQLite storage on Render's free tier is ephemeral: invoice runs and local settings can be lost on restart or redeploy. Use a persistent disk or an external database for anything beyond a disposable demo; the simulated history regenerates on startup.
+The runtime dependencies in `requirements.txt` are pinned. The app uses `DB_PATH` for SQLite and creates the parent directory when needed; by default it stores `app.db` beside the application. For persistence on Render, attach a persistent disk mounted at `/var/data` and set `DB_PATH=/var/data/app.db`. Render's free tier has ephemeral storage, so invoice runs and local settings can be lost on restart or redeploy. The simulated history regenerates on startup. PostgreSQL support is a future improvement; it is not implemented.
 
 ## De-risking checklist
 

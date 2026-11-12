@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import calendar
+import hashlib
 import json
 import os
 import sqlite3
@@ -13,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 _test_directory = tempfile.TemporaryDirectory(prefix="forward-to-decide-tests-")
 os.environ["DB_PATH"] = str(Path(_test_directory.name) / "analytics.sqlite")
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
 import db
 import main
@@ -26,27 +28,76 @@ def epoch(day):
 
 class AnalyticsApiTests(unittest.TestCase):
     def setUp(self):
+        self.admin_patcher = patch.dict(
+            os.environ, {"ADMIN_TOKEN": "fixture-admin-token"}, clear=False,
+        )
+        self.admin_patcher.start()
         db.init()
         main.UPLOAD_RATE_LIMITS.clear()
         self.connection = db.conn()
         self.connection.execute("delete from email_notifications")
+        self.connection.execute("delete from vendor_email_addresses")
         self.connection.execute("delete from vendor_emails")
         self.connection.execute("delete from runs")
         self.connection.execute("delete from trust")
         self.connection.execute("delete from tol_override")
         self.connection.execute("update vendors set email=''")
         self.connection.commit()
-        self.client = TestClient(main.app)
+        self.client = TestClient(
+            main.app, headers={"X-Admin-Token": "fixture-admin-token"},
+        )
+        self.local_client = TestClient(
+            main.app, client=("127.0.0.1", 50000),
+        )
 
     def tearDown(self):
         self.client.close()
+        self.local_client.close()
         self.connection.close()
+        self.admin_patcher.stop()
 
     def test_healthz_confirms_database_readiness(self):
         response = self.client.get("/healthz")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
+
+    def test_loopback_dashboard_apis_work_without_authentication(self):
+        responses = [
+            self.local_client.get("/api/runs"),
+            self.local_client.get("/api/vendors"),
+            self.local_client.get("/api/analytics"),
+            self.local_client.get("/api/email-history"),
+            self.local_client.get("/api/live?after=0"),
+            self.local_client.get("/api/samples"),
+            self.local_client.post("/api/inbound", json={"Attachments": []}),
+        ]
+
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertEqual(responses[1].json()[0]["id"], "V001")
+        self.assertIn("kpis", responses[2].json())
+        self.assertEqual(responses[3].json(), [])
+        self.assertEqual(responses[-1].json(), {"queued": 0})
+
+    def test_loopback_invoice_upload_and_review_work_without_authentication(self):
+        self.add_run("local-review", 8, "V001", "REVIEW", "pending", 100)
+
+        async def fake_pipeline(*_args, **_kwargs):
+            yield json.dumps({"type": "start"}) + "\n"
+
+        with patch("main.pipeline", new=fake_pipeline):
+            upload = self.local_client.post(
+                "/api/run",
+                files={"file": ("local.pdf", b"%PDF-1.4 fixture", "application/pdf")},
+            )
+        review = self.local_client.post(
+            "/api/runs/local-review/review", json={"verdict": "approve"},
+        )
+
+        self.assertEqual(upload.status_code, 200, upload.text)
+        self.assertIn('"type": "start"', upload.text)
+        self.assertEqual(review.status_code, 200, review.text)
+        self.assertEqual(review.json()["status"], "approved")
 
     def add_run(self, run_id, day, vendor_id, action, status, total, email_status=None):
         self.connection.execute(
@@ -69,6 +120,37 @@ class AnalyticsApiTests(unittest.TestCase):
                  "SMTP unavailable" if email_status == "FAILED" else None),
             )
         self.connection.commit()
+
+    def process_missing_invoice(
+        self, invoice_email=None, vendor_name="Meridian Print & Packaging",
+        file_identity=None, filename="missing-contact.pdf",
+        vendor_name_confidence=0.99, email_confidence=0.99,
+    ):
+        invoice = inv(
+            vendor_name, None, "2026-11-04", "PO-1004",
+            [("Retail boxes", 5, 10)], 0, "1204", total=None,
+        )
+        invoice["vendor_email"] = invoice_email
+        invoice["vendor_email_invalid"] = bool(
+            invoice_email and not main.email_service.valid_email(invoice_email)
+        )
+        invoice["confidence"] = {
+            "vendor_name": vendor_name_confidence,
+            "vendor_email": email_confidence if invoice_email else None,
+        }
+        if file_identity is not None:
+            invoice["_test_file_identity"] = file_identity
+
+        async def process_once():
+            return [
+                json.loads(line)
+                async for line in main.pipeline(
+                    filename, None, None, "sample", invoice,
+                )
+            ]
+
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            return asyncio.run(process_once())
 
     def populate(self):
         self.add_run("r1", 1, "V001", "AUTO_APPROVE", "auto_approved", 100)
@@ -170,14 +252,23 @@ class AnalyticsApiTests(unittest.TestCase):
         self.assertEqual(invalid.status_code, 400)
 
     def test_failed_email_resend_creates_a_history_attempt(self):
+        self.connection.execute(
+            "update vendors set email='ap@meridian.example' where vendor_id='V004'"
+        )
+        self.connection.commit()
         self.add_run("retry", 8, "V004", "HOLD_FOR_INFO", "pending", 99, "FAILED")
         original = self.connection.execute(
             "select id from email_notifications where run_id='retry'"
         ).fetchone()["id"]
-        with patch("main.email_service.send_email", return_value={
+        with patch.dict(os.environ, {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "ap@meridian.example",
+            "SMTP_HOST": "smtp.example.test",
+            "SMTP_FROM_EMAIL": "accounts@example.test",
+        }), patch("main.email_service.send_email", return_value={
             "recipient": "ap@vendor.example", "status": "SENT", "error": None
         }):
-            response = self.client.post(f"/api/runs/retry/emails/{original}/resend")
+            response = self.local_client.post(f"/api/runs/retry/emails/{original}/resend")
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["status"], "SENT")
@@ -190,7 +281,7 @@ class AnalyticsApiTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([(row["status"], row["attempt_number"]) for row in notifications],
                          [("FAILED", 1), ("SENT", 2)])
-        again = self.client.post(f"/api/runs/retry/emails/{original}/resend")
+        again = self.local_client.post(f"/api/runs/retry/emails/{original}/resend")
         self.assertEqual(again.status_code, 409)
 
     def test_reprocessing_same_hold_invoice_keeps_one_demo_outbox_draft(self):
@@ -312,15 +403,589 @@ class AnalyticsApiTests(unittest.TestCase):
         self.assertEqual(decision["vendor_email"]["status"], "SENT")
         send.assert_called_once()
 
+    def test_invoice_contact_is_sent_when_allowlisted_and_master_is_empty(self):
+        environment = {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "billing@outside.example",
+            "EMAIL_MAX_PER_HOUR": "5",
+            "SMTP_HOST": "smtp.example.test",
+            "SMTP_FROM_EMAIL": "accounts@example.test",
+        }
+        with patch.dict(os.environ, environment), patch(
+            "main.email_service.send_email",
+            return_value={"recipient": "billing@outside.example", "status": "SENT", "error": None},
+        ) as send:
+            events = self.process_missing_invoice("Billing@Outside.Example")
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        self.assertEqual(decision["action"], "HOLD_FOR_INFO")
+        self.assertEqual(decision["vendor_email"]["recipient"], "billing@outside.example")
+        self.assertEqual(decision["vendor_email"]["recipient_source"], "from invoice, allowlisted")
+        send.assert_called_once_with(
+            "billing@outside.example",
+            decision["vendor_email"]["subject"],
+            decision["vendor_email"]["body"],
+        )
+        history = self.client.get(
+            f"/api/runs/{next(event['run_id'] for event in events if event['type'] == 'decision')}"
+        ).json()["email_history"][0]
+        self.assertEqual(history["recipient_source"], "from invoice, allowlisted")
+        self.assertEqual(
+            self.client.get("/api/email-history").json()[0]["recipient_source"],
+            "from invoice, allowlisted",
+        )
+
+    def test_invoice_contact_on_configured_vendor_domain_is_sent_without_allowlist(self):
+        environment = {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "",
+            "EMAIL_MAX_PER_HOUR": "5",
+            "SMTP_HOST": "smtp.example.test",
+            "SMTP_FROM_EMAIL": "accounts@example.test",
+        }
+        with patch.dict(os.environ, environment), patch(
+            "main.email_service.send_email",
+            return_value={
+                "recipient": "accounts@meridian.example.com",
+                "status": "SENT",
+                "error": None,
+            },
+        ) as send:
+            events = self.process_missing_invoice("Accounts@Meridian.Example.Com")
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        self.assertEqual(
+            decision["vendor_email"]["recipient_source"],
+            "automatically authorized extracted invoice email",
+        )
+        address = self.connection.execute(
+            "select * from vendor_email_addresses where email='accounts@meridian.example.com'"
+        ).fetchone()
+        self.assertEqual(address["authorization_status"], "AUTHORIZED")
+        self.assertIn("exact configured vendor domain", address["authorization_reason"])
+        self.assertGreaterEqual(address["extraction_confidence"], 0.90)
+        send.assert_called_once()
+
+    def test_authorized_extracted_email_is_reused_when_later_invoice_omits_it(self):
+        environment = {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "",
+            "EMAIL_MAX_PER_HOUR": "5",
+            "SMTP_HOST": "smtp.example.test",
+            "SMTP_FROM_EMAIL": "accounts@example.test",
+        }
+
+        def accepted(recipient, *_):
+            return {"recipient": recipient, "status": "SENT", "error": None}
+
+        with patch.dict(os.environ, environment), patch(
+            "main.email_service.send_email", side_effect=accepted,
+        ) as send:
+            self.process_missing_invoice("accounts@meridian.example.com")
+            later = self.process_missing_invoice(
+                None, file_identity="invoice-without-contact", filename="later.pdf",
+            )
+
+        decision = next(event["decision"] for event in later if event["type"] == "decision")
+        self.assertEqual(decision["vendor_email"]["recipient"], "accounts@meridian.example.com")
+        self.assertEqual(
+            decision["vendor_email"]["recipient_source"],
+            "automatically authorized extracted invoice email",
+        )
+        self.assertEqual(send.call_count, 2)
+
+    def test_vendor_can_have_multiple_extracted_addresses(self):
+        self.process_missing_invoice(
+            "accounts@meridian.example.com", file_identity="invoice-one",
+        )
+        self.process_missing_invoice(
+            "billing@meridian.example.com", file_identity="invoice-two",
+        )
+        rows = self.connection.execute(
+            "select email,authorization_status from vendor_email_addresses "
+            "where vendor_id='V004' order by email"
+        ).fetchall()
+        self.assertEqual(
+            [(row["email"], row["authorization_status"]) for row in rows],
+            [
+                ("accounts@meridian.example.com", "AUTHORIZED"),
+                ("billing@meridian.example.com", "AUTHORIZED"),
+            ],
+        )
+
+    def test_untrusted_current_email_does_not_fall_back_to_an_old_authorized_address(self):
+        self.process_missing_invoice("accounts@meridian.example.com")
+        with patch.dict(os.environ, {
+            "EMAIL_MODE": "smtp", "EMAIL_ALLOWLIST": "",
+            "SMTP_HOST": "smtp.example.test", "SMTP_FROM_EMAIL": "accounts@example.test",
+        }), patch("main.email_service.send_email") as send:
+            events = self.process_missing_invoice(
+                "billing@outside.example", file_identity="untrusted-current-email",
+            )
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        self.assertEqual(decision["vendor_email"]["status"], "OUTBOX")
+        self.assertIsNone(decision["vendor_email"]["recipient"])
+        self.assertIn("not authorized", decision["vendor_email"]["error"])
+        send.assert_not_called()
+
+    def test_invalid_extracted_email_is_stored_pending_and_not_sent(self):
+        with patch.dict(os.environ, {
+            "EMAIL_MODE": "smtp", "EMAIL_ALLOWLIST": "",
+            "SMTP_HOST": "smtp.example.test", "SMTP_FROM_EMAIL": "accounts@example.test",
+        }), patch("main.email_service.send_email") as send:
+            events = self.process_missing_invoice("invalid-address")
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        email = decision["vendor_email"]
+        row = self.connection.execute(
+            "select * from vendor_email_addresses where email='invalid-address'"
+        ).fetchone()
+        self.assertEqual(row["authorization_status"], "PENDING_REVIEW")
+        self.assertIn("not a valid email", row["authorization_reason"])
+        self.assertEqual(email["status"], "OUTBOX")
+        self.assertIn("invalid", email["error"])
+        send.assert_not_called()
+
+    def test_low_confidence_vendor_match_does_not_authorize_email(self):
+        with patch.dict(os.environ, {
+            "EMAIL_MODE": "smtp", "EMAIL_ALLOWLIST": "",
+            "SMTP_HOST": "smtp.example.test", "SMTP_FROM_EMAIL": "accounts@example.test",
+        }), patch("main.rules.match_vendor", return_value=("V004", 0.84)), \
+             patch("main.email_service.send_email") as send:
+            events = self.process_missing_invoice("accounts@meridian.example.com")
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        row = self.connection.execute(
+            "select authorization_status,authorization_reason "
+            "from vendor_email_addresses where email='accounts@meridian.example.com'"
+        ).fetchone()
+        self.assertEqual(row["authorization_status"], "PENDING_REVIEW")
+        self.assertIn("below the 90%", row["authorization_reason"])
+        self.assertEqual(decision["vendor_email"]["status"], "OUTBOX")
+        send.assert_not_called()
+
+    def test_low_email_extraction_confidence_does_not_authorize_email(self):
+        with patch.dict(os.environ, {
+            "EMAIL_MODE": "smtp", "EMAIL_ALLOWLIST": "",
+            "SMTP_HOST": "smtp.example.test", "SMTP_FROM_EMAIL": "accounts@example.test",
+        }), patch("main.email_service.send_email") as send:
+            events = self.process_missing_invoice(
+                "accounts@meridian.example.com", email_confidence=0.89,
+            )
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        row = self.connection.execute(
+            "select authorization_status,authorization_reason "
+            "from vendor_email_addresses where email='accounts@meridian.example.com'"
+        ).fetchone()
+        self.assertEqual(row["authorization_status"], "PENDING_REVIEW")
+        self.assertIn("Email extraction confidence", row["authorization_reason"])
+        self.assertEqual(decision["vendor_email"]["status"], "OUTBOX")
+        send.assert_not_called()
+
+    def test_conflicting_saved_vendor_contact_blocks_auto_authorization(self):
+        self.connection.execute(
+            "update vendors set email='saved@meridian.example.com' where vendor_id='V004'"
+        )
+        self.connection.commit()
+        with patch.dict(os.environ, {
+            "EMAIL_MODE": "smtp", "EMAIL_ALLOWLIST": "",
+            "SMTP_HOST": "smtp.example.test", "SMTP_FROM_EMAIL": "accounts@example.test",
+        }), patch("main.email_service.send_email") as send:
+            events = self.process_missing_invoice("accounts@meridian.example.com")
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        row = self.connection.execute(
+            "select authorization_status,authorization_reason "
+            "from vendor_email_addresses where email='accounts@meridian.example.com'"
+        ).fetchone()
+        self.assertEqual(row["authorization_status"], "PENDING_REVIEW")
+        self.assertIn("conflicts with the vendor's saved contact", row["authorization_reason"])
+        self.assertEqual(decision["vendor_email"]["recipient"], "saved@meridian.example.com")
+        self.assertEqual(decision["vendor_email"]["status"], "OUTBOX")
+        send.assert_not_called()
+
+    def test_unrelated_vendor_domain_is_not_auto_authorized(self):
+        with patch.dict(os.environ, {
+            "EMAIL_MODE": "smtp", "EMAIL_ALLOWLIST": "",
+            "SMTP_HOST": "smtp.example.test", "SMTP_FROM_EMAIL": "accounts@example.test",
+        }), patch("main.email_service.send_email") as send:
+            events = self.process_missing_invoice("billing@unrelated.example")
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        row = self.connection.execute(
+            "select authorization_status,authorization_reason "
+            "from vendor_email_addresses where email='billing@unrelated.example'"
+        ).fetchone()
+        self.assertEqual(row["authorization_status"], "PENDING_REVIEW")
+        self.assertIn("does not match a configured domain", row["authorization_reason"])
+        self.assertEqual(decision["vendor_email"]["status"], "OUTBOX")
+        self.assertIn("not authorized", decision["vendor_email"]["error"])
+        send.assert_not_called()
+
+    def test_vendor_email_registry_is_visible_in_vendor_apis(self):
+        self.process_missing_invoice("accounts@meridian.example.com")
+
+        vendor = next(
+            item for item in self.client.get("/api/vendors").json()
+            if item["id"] == "V004"
+        )
+        analytics_vendor = next(
+            item for item in self.client.get("/api/analytics").json()["vendor_performance"]
+            if item["vendor_id"] == "V004"
+        )
+        self.assertEqual(vendor["email_addresses"][0]["email"], "accounts@meridian.example.com")
+        self.assertEqual(vendor["email_addresses"][0]["authorization_status"], "AUTHORIZED")
+        self.assertEqual(
+            analytics_vendor["email_addresses"][0]["source_invoice_hash"],
+            vendor["email_addresses"][0]["source_invoice_hash"],
+        )
+
+    def test_saved_master_contact_wins_and_notes_different_invoice_email(self):
+        self.connection.execute(
+            "update vendors set email='billing@meridian.example' where vendor_id='V004'"
+        )
+        self.connection.commit()
+        environment = {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "billing@meridian.example",
+            "EMAIL_MAX_PER_HOUR": "5",
+            "SMTP_HOST": "smtp.example.test",
+            "SMTP_FROM_EMAIL": "accounts@example.test",
+        }
+        with patch.dict(os.environ, environment), patch(
+            "main.email_service.send_email",
+            return_value={
+                "recipient": "billing@meridian.example", "status": "SENT", "error": None,
+            },
+        ) as send:
+            events = self.process_missing_invoice("invoice@outside.example")
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        email = decision["vendor_email"]
+        self.assertEqual(email["recipient"], "billing@meridian.example")
+        self.assertEqual(email["recipient_source"], "vendor master")
+        self.assertIn("invoice@outside.example", email["recipient_note"])
+        send.assert_called_once_with(
+            "billing@meridian.example", email["subject"], email["body"],
+        )
+
+    def test_unverified_invoice_email_is_outbox_without_sending(self):
+        environment = {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "",
+            "EMAIL_MAX_PER_HOUR": "5",
+            "SMTP_HOST": "smtp.example.test",
+            "SMTP_FROM_EMAIL": "accounts@example.test",
+        }
+        with patch.dict(os.environ, environment), patch(
+            "main.email_service.send_email"
+        ) as send:
+            events = self.process_missing_invoice("billing@outside.example")
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        email = decision["vendor_email"]
+        self.assertEqual(email["status"], "OUTBOX")
+        self.assertIsNone(email["recipient"])
+        self.assertEqual(email["recipient_source"], "no verified recipient")
+        self.assertIn("no verified recipient", email["error"])
+        self.assertIn("not authorized", email["error"])
+        send.assert_not_called()
+
+    def test_different_files_and_recipients_create_separate_notifications(self):
+        environment = {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "first@outside.example,second@outside.example",
+            "EMAIL_MAX_PER_HOUR": "5",
+            "SMTP_HOST": "smtp.example.test",
+            "SMTP_FROM_EMAIL": "accounts@example.test",
+        }
+
+        def accepted(recipient, *_):
+            return {"recipient": recipient, "status": "SENT", "error": None}
+
+        with patch.dict(os.environ, environment), patch(
+            "main.email_service.send_email", side_effect=accepted,
+        ) as send:
+            first = self.process_missing_invoice(
+                "first@outside.example", file_identity="invoice-file-one",
+                filename="first.pdf",
+            )
+            second = self.process_missing_invoice(
+                "second@outside.example", file_identity="invoice-file-two",
+                filename="second.pdf",
+            )
+
+        decisions = [
+            next(event["decision"] for event in events if event["type"] == "decision")
+            for events in (first, second)
+        ]
+        self.assertEqual([decision["action"] for decision in decisions],
+                         ["HOLD_FOR_INFO", "HOLD_FOR_INFO"])
+        self.assertEqual(
+            [decision["vendor_email"]["recipient"] for decision in decisions],
+            ["first@outside.example", "second@outside.example"],
+        )
+        notifications = self.connection.execute(
+            "select recipient,status from email_notifications order by id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["recipient"], row["status"]) for row in notifications],
+            [("first@outside.example", "SENT"), ("second@outside.example", "SENT")],
+        )
+        self.assertEqual(send.call_count, 2)
+
+    def test_same_file_and_recipient_after_sent_is_deduplicated(self):
+        environment = {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "same@outside.example",
+            "EMAIL_MAX_PER_HOUR": "5",
+            "SMTP_HOST": "smtp.example.test",
+            "SMTP_FROM_EMAIL": "accounts@example.test",
+        }
+
+        def accepted(recipient, *_):
+            return {"recipient": recipient, "status": "SENT", "error": None}
+
+        with patch.dict(os.environ, environment), patch(
+            "main.rules.dup_check",
+            return_value=main.rules.ck("R5", "pass", "No duplicate"),
+        ), patch("main.email_service.send_email", side_effect=accepted) as send:
+            first = self.process_missing_invoice(
+                "same@outside.example",
+            )
+            second = self.process_missing_invoice(
+                "same@outside.example",
+            )
+
+        second_decision = next(
+            event["decision"] for event in second if event["type"] == "decision"
+        )
+        self.assertTrue(second_decision["vendor_email"]["duplicate_prevented"])
+        self.assertEqual(second_decision["vendor_email"]["status"], "SENT")
+        self.assertEqual(
+            self.connection.execute("select count(*) from email_notifications").fetchone()[0],
+            1,
+        )
+        send.assert_called_once()
+
+    def test_same_file_and_recipient_retries_after_failed_attempt(self):
+        environment = {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "retry@outside.example",
+            "EMAIL_MAX_PER_HOUR": "5",
+            "SMTP_HOST": "smtp.example.test",
+            "SMTP_FROM_EMAIL": "accounts@example.test",
+        }
+        outcomes = [
+            {"recipient": "retry@outside.example", "status": "FAILED",
+             "error": "SMTP login failed (SMTPServerDisconnected): Connection unexpectedly closed"},
+            {"recipient": "retry@outside.example", "status": "SENT", "error": None},
+        ]
+
+        with patch.dict(os.environ, environment), patch(
+            "main.rules.dup_check",
+            return_value=main.rules.ck("R5", "pass", "No duplicate"),
+        ), patch(
+            "main.email_service.send_email", side_effect=outcomes,
+        ) as send:
+            self.process_missing_invoice(
+                "retry@outside.example",
+            )
+            second = self.process_missing_invoice(
+                "retry@outside.example",
+            )
+
+        second_decision = next(
+            event["decision"] for event in second if event["type"] == "decision"
+        )
+        self.assertEqual(second_decision["vendor_email"]["status"], "SENT")
+        notifications = self.connection.execute(
+            "select status,attempt_number,error from email_notifications order by id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["status"], row["attempt_number"]) for row in notifications],
+            [("FAILED", 1), ("SENT", 2)],
+        )
+        self.assertIn("SMTP login failed", notifications[0]["error"])
+        self.assertEqual(
+            self.client.get("/api/email-history").json()[-1]["error"],
+            notifications[0]["error"],
+        )
+        self.assertEqual(send.call_count, 2)
+
+    def test_unverified_recipient_creates_outbox_despite_matching_failed_notification(self):
+        invoice_email = "billing@outside.example"
+        invoice = inv(
+            "Meridian Print & Packaging", None, "2026-11-04", "PO-1004",
+            [("Retail boxes", 5, 10)], 0, "1204", total=None,
+        )
+        invoice["vendor_email"] = invoice_email
+        invoice["vendor_email_invalid"] = False
+        invoice["confidence"] = {"vendor_name": 0.99, "vendor_email": 0.99}
+        file_hash = hashlib.sha256(json.dumps(invoice, sort_keys=True).encode()).hexdigest()
+        issues = main.email_service.critical_field_issues(invoice)
+        notification_key = main.email_service.notification_key(
+            "V004", invoice, file_hash,
+            issues, invoice_email,
+        )
+        self.connection.execute(
+            "insert into email_notifications"
+            "(run_id,vendor_id,dedupe_key,notification_key,attempt_number,recipient,"
+            "subject,body,status,error,created_at) values(?,?,?,?,?,?,?,?,?,?,?)",
+            ("previous", "V004", f"{notification_key}:1", notification_key, 1,
+             invoice_email, "Subject", "Body", "FAILED", "Prior SMTP failure", time.time()),
+        )
+        self.connection.commit()
+        environment = {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "",
+            "EMAIL_MAX_PER_HOUR": "5",
+            "SMTP_HOST": "smtp.example.test",
+            "SMTP_FROM_EMAIL": "accounts@example.test",
+        }
+
+        with patch.dict(os.environ, environment), patch(
+            "main.email_service.send_email"
+        ) as send:
+            events = self.process_missing_invoice(
+                invoice_email,
+            )
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        self.assertEqual(decision["vendor_email"]["status"], "OUTBOX")
+        self.assertIn("no verified recipient", decision["vendor_email"]["error"])
+        self.assertIn("not authorized", decision["vendor_email"]["error"])
+        self.assertEqual(
+            self.connection.execute(
+                "select count(*) from email_notifications where notification_key=?",
+                (notification_key,),
+            ).fetchone()[0],
+            2,
+        )
+        send.assert_not_called()
+
+    def test_failed_smtp_attempt_counts_toward_hourly_email_cap(self):
+        now = time.time()
+        self.connection.execute(
+            "insert into email_notifications"
+            "(run_id,dedupe_key,notification_key,subject,body,status,error,created_at,attempted_at) "
+            "values(?,?,?,?,?,?,?,?,?)",
+            ("prior-failed-send", "prior-failed-send", "prior-failed-send",
+             "Subject", "Body", "FAILED", "SMTP send failed (OSError): reset",
+             now, now),
+        )
+        self.connection.commit()
+        environment = {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "hourly-cap@outside.example",
+            "EMAIL_MAX_PER_HOUR": "1",
+            "SMTP_HOST": "smtp.example.test",
+            "SMTP_FROM_EMAIL": "accounts@example.test",
+        }
+        with patch.dict(os.environ, environment), patch(
+            "main.email_service.send_email"
+        ) as send:
+            events = self.process_missing_invoice("hourly-cap@outside.example")
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        email = decision["vendor_email"]
+        self.assertEqual(email["status"], "OUTBOX")
+        self.assertIn("Hourly email limit reached", email["error"])
+        send.assert_not_called()
+
+    def test_unknown_vendor_with_missing_fields_never_sends_email(self):
+        invoice = inv(
+            "Unknown Supplier", None, "2026-11-04", None,
+            [("Supplies", 1, 10)], 0, "9999", total=None,
+        )
+        invoice["vendor_email"] = "accounts@outside.example"
+        with patch.dict(os.environ, {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "accounts@outside.example",
+        }), patch("main.asyncio.sleep", new=AsyncMock()), patch(
+            "main.email_service.send_email"
+        ) as send:
+            async def process_once():
+                return [json.loads(line) async for line in main.pipeline(
+                    "unknown-missing.pdf", None, None, "sample", invoice,
+                )]
+            events = asyncio.run(process_once())
+
+        decision = next(event["decision"] for event in events if event["type"] == "decision")
+        self.assertEqual(decision["action"], "ESCALATE")
+        self.assertIsNone(decision["vendor_email"])
+        self.assertEqual(
+            self.connection.execute("select count(*) from email_notifications").fetchone()[0],
+            0,
+        )
+        send.assert_not_called()
+
+    def test_action_and_hard_stop_guards_block_any_draft_send(self):
+        original_decide = main.rules.decide
+        cases = [
+            ("ESCALATE", False),
+            ("AUTO_REJECT", False),
+            ("HOLD_FOR_INFO", True),
+        ]
+        with patch.dict(os.environ, {
+            "EMAIL_MODE": "smtp",
+            "EMAIL_ALLOWLIST": "guarded@meridian.example.com",
+            "EMAIL_MAX_PER_HOUR": "5",
+        }), patch("main.asyncio.sleep", new=AsyncMock()), patch(
+            "main.email_service.send_email"
+        ) as send:
+            for index, (action, has_hard_stop) in enumerate(cases):
+                def guarded_decision(*args, **kwargs):
+                    decision = original_decide(*args, **kwargs)
+                    decision["action"] = action
+                    decision["hard_stops"] = ["fixture hard stop"] if has_hard_stop else []
+                    decision["vendor_email"] = {"subject": "Draft", "body": "Request"}
+                    return decision
+
+                invoice = inv(
+                    "Meridian Print & Packaging", None, "2026-11-04", "PO-1004",
+                    [("Retail boxes", 5, 10)], 0, "1204", total=None,
+                )
+                invoice["vendor_email"] = f"guarded-{index}@meridian.example.com"
+                with patch("main.rules.decide", side_effect=guarded_decision):
+                    async def process_once():
+                        return [
+                            json.loads(line)
+                            async for line in main.pipeline(
+                                f"guarded-{index}.pdf", None, None, "sample", invoice,
+                            )
+                        ]
+                    events = asyncio.run(process_once())
+
+                decision_event = next(
+                    event for event in events if event["type"] == "decision"
+                )
+                self.assertIsNone(decision_event["decision"]["vendor_email"])
+
+        self.assertEqual(
+            self.connection.execute("select count(*) from email_notifications").fetchone()[0],
+            0,
+        )
+        send.assert_not_called()
+
     def test_admin_token_protects_mutating_admin_routes_when_configured(self):
         with patch.dict(os.environ, {"ADMIN_TOKEN": "fixture-admin-token"}):
-            self.assertEqual(self.client.post("/api/reset").status_code, 403)
-            self.assertEqual(
-                self.client.put("/api/vendors/V001/email", json={"email": ""}).status_code,
-                403,
-            )
+            unauthenticated = TestClient(main.app)
+            try:
+                self.assertEqual(unauthenticated.post("/api/reset").status_code, 401)
+                self.assertEqual(
+                    unauthenticated.put(
+                        "/api/vendors/V001/email", json={"email": ""},
+                    ).status_code,
+                    401,
+                )
+            finally:
+                unauthenticated.close()
             accepted = self.client.post(
-                "/api/proposals/accept?admin_token=fixture-admin-token",
+                "/api/proposals/accept",
+                headers={"X-Admin-Token": "fixture-admin-token"},
                 json={"vendor_id": "V001", "tol": 0.02},
             )
             reset = self.client.post(
@@ -328,6 +993,68 @@ class AnalyticsApiTests(unittest.TestCase):
             )
         self.assertEqual(accepted.status_code, 200)
         self.assertEqual(reset.status_code, 200)
+
+    def test_missing_admin_token_fails_closed_for_privileged_operation(self):
+        with patch.dict(os.environ, {"ADMIN_TOKEN": ""}):
+            response = self.client.post("/api/reset")
+            insecure_default = self.client.get(
+                "/api/vendors", headers={"X-Admin-Token": "dev-token"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "ADMIN_TOKEN is not configured")
+        self.assertEqual(insecure_default.status_code, 503)
+
+    def test_admin_authentication_rejects_missing_and_invalid_credentials(self):
+        unauthenticated = TestClient(main.app)
+        try:
+            missing = unauthenticated.get("/api/vendors")
+        finally:
+            unauthenticated.close()
+        invalid = self.client.get(
+            "/api/vendors", headers={"X-Admin-Token": "invalid-credential"},
+        )
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertIn("WWW-Authenticate", missing.headers)
+        self.assertEqual(invalid.status_code, 403)
+        self.assertEqual(self.client.get("/api/vendors").status_code, 200)
+
+    def test_private_api_endpoints_require_admin_authentication(self):
+        unauthenticated = TestClient(main.app)
+        try:
+            paths = (
+                "/api/runs", "/api/runs/missing", "/api/vendors",
+                "/api/email-history", "/api/analytics", "/api/stats",
+                "/api/proposals", "/api/live",
+            )
+            responses = [unauthenticated.get(path) for path in paths]
+            responses.extend((
+                unauthenticated.post(
+                    "/api/runs/missing/review", json={"verdict": "approve"},
+                ),
+                unauthenticated.post(
+                    "/api/runs/missing/emails/1/resend",
+                ),
+                unauthenticated.post("/api/run"),
+            ))
+            health = unauthenticated.get("/healthz")
+            home = unauthenticated.get("/")
+        finally:
+            unauthenticated.close()
+
+        self.assertTrue(all(response.status_code == 401 for response in responses))
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(home.status_code, 200)
+
+    def test_basic_authentication_supports_browser_dashboard_access(self):
+        authorization = "Basic " + base64.b64encode(
+            b"admin:fixture-admin-token"
+        ).decode("ascii")
+        with TestClient(main.app, headers={"Authorization": authorization}) as client:
+            response = client.get("/api/vendors")
+
+        self.assertEqual(response.status_code, 200)
 
     def test_tolerance_proposal_includes_replayed_backtest_counts(self):
         main.VENDORS["V001"]["tol"] = main.DEFAULT_TOL["V001"]
@@ -479,6 +1206,8 @@ class AnalyticsApiTests(unittest.TestCase):
         tasks = []
 
         class InboundRequest:
+            headers = {"X-Inbound-Token": "fixture-inbound-token"}
+
             async def json(self):
                 return {
                     "From": sender,
@@ -500,7 +1229,7 @@ class AnalyticsApiTests(unittest.TestCase):
                 "main.asyncio.create_task",
                 side_effect=lambda coroutine: tasks.append(asyncio.ensure_future(coroutine)),
             ):
-                response = await main.inbound("fixture-inbound-token", InboundRequest())
+                response = await main._process_inbound(InboundRequest())
                 await asyncio.gather(*tasks)
                 return response
 
@@ -509,6 +1238,31 @@ class AnalyticsApiTests(unittest.TestCase):
         self.assertEqual(response, {"queued": 1})
         self.assertEqual(pipeline_calls[0][0][3], "email")
         self.assertEqual(pipeline_calls[0][1], sender)
+
+    def test_inbound_webhook_requires_configured_header_token(self):
+        with patch.dict(os.environ, {"INBOUND_TOKEN": "real-fixture-token"}):
+            missing = self.client.post("/api/inbound", json={"Attachments": []})
+            invalid = self.client.post(
+                "/api/inbound", headers={"X-Inbound-Token": "wrong-token"},
+                json={"Attachments": []},
+            )
+            accepted = self.client.post(
+                "/api/inbound", headers={"X-Inbound-Token": "real-fixture-token"},
+                json={"Attachments": []},
+            )
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(invalid.status_code, 403)
+        self.assertEqual(accepted.status_code, 200)
+
+    def test_inbound_webhook_has_no_insecure_dev_token_fallback(self):
+        with patch.dict(os.environ, {"INBOUND_TOKEN": ""}):
+            response = self.client.post(
+                "/api/inbound", headers={"X-Inbound-Token": "dev-token"},
+                json={"Attachments": []},
+            )
+
+        self.assertEqual(response.status_code, 503)
 
     def test_non_email_run_has_neutral_sender_domain_check(self):
         with patch("main.asyncio.sleep", new=AsyncMock()):
@@ -597,7 +1351,8 @@ class AnalyticsApiTests(unittest.TestCase):
             db.DB = original_db
 
         self.assertTrue({
-            "notification_key", "attempt_number", "resend_claimed_at"
+            "notification_key", "attempt_number", "resend_claimed_at",
+            "recipient_source", "recipient_note",
         }.issubset(columns))
         self.assertEqual(tuple(record), (
             "old-key", 1, None, "FAILED", "Previous SMTP error"

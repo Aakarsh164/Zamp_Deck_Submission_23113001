@@ -20,7 +20,38 @@ class SafetyConfigurationTests(unittest.TestCase):
         patterns = set((ROOT / ".gitignore").read_text(encoding="utf-8").splitlines())
 
         self.assertTrue({".env", ".env.*", "!.env.example", "app.db",
-                         ".venv/", "__pycache__/", "test_invoices/"}.issubset(patterns))
+                         ".venv/", "venv/", "__pycache__/", "*.pyc",
+                         "app.db-wal", "app.db-shm", "*.db-journal",
+                         "test_invoices/",
+                         "smtp_diag.py", "*.log", ".git/"}.issubset(patterns))
+
+    def test_dockerignore_excludes_secrets_databases_and_local_artifacts(self):
+        patterns = set((ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines())
+
+        self.assertTrue({
+            ".env", ".env.*", "!.env.example", ".venv/", "venv/",
+            "__pycache__/", "*.pyc", "app.db", "*.db-wal", "*.db-shm",
+            "*.db-journal", "test_invoices/", "smtp_diag.py", "*.log", ".git/",
+        }.issubset(patterns))
+
+    def test_frontend_uses_local_api_without_token_login(self):
+        frontend = (ROOT / "static" / "dashboard.js").read_text(encoding="utf-8")
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+
+        for token_name in ("ADMIN_TOKEN", "INBOUND_TOKEN", "X-Admin-Token", "X-Inbound-Token"):
+            self.assertNotIn(token_name, frontend)
+            self.assertNotIn(token_name, html)
+        for login_marker in ("authGate", "adminTokenInput", "loginForm", "sessionStorage"):
+            self.assertNotIn(login_marker, frontend)
+            self.assertNotIn(login_marker, html)
+        self.assertIn('return fetch(url, options);', frontend)
+        self.assertIn("setInterval(pollLive, 1500)", frontend)
+
+    def test_local_development_docs_keep_server_loopback_bound(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("--host 127.0.0.1 --port 8000", readme)
+        self.assertIn("authentication must be configured before public or multi-user deployment", readme)
 
     def test_secret_scanner_detects_key_prefix_and_smtp_password_patterns(self):
         examples = (

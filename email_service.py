@@ -2,7 +2,6 @@ import hashlib
 import os
 import re
 import smtplib
-import socket
 import ssl
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -16,13 +15,90 @@ FIELD_LABELS = {
     "invoice_date": "Invoice date",
     "total": "Invoice total",
 }
+EMAIL_PATTERN = re.compile(
+    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z]{2,63}"
+)
 
 
 def valid_email(value):
     if not isinstance(value, str) or "\r" in value or "\n" in value:
         return False
     address = parseaddr(value.strip())[1]
-    return bool(address == value.strip() and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", address))
+    return bool(address == value.strip() and EMAIL_PATTERN.fullmatch(address))
+
+
+def normalize_email(value):
+    if not valid_email(value):
+        return None
+    return value.strip().lower()
+
+
+def select_recipient(
+    vendor_contact, invoice_email, vendor_domains, *, dynamically_authorized=False
+):
+    master = normalize_email(vendor_contact)
+    invoice = normalize_email(invoice_email)
+    allowlist = {
+        normalized
+        for normalized in (
+            normalize_email(item)
+            for item in os.getenv("EMAIL_ALLOWLIST", "").split(",")
+        )
+        if normalized
+    }
+    domains = {
+        str(domain).strip().lower().lstrip("@")
+        for domain in vendor_domains or []
+        if isinstance(domain, str) and domain.strip()
+    }
+    invoice_domain_verified = bool(
+        invoice and invoice.rsplit("@", 1)[1] in domains
+    )
+    if master:
+        note = (
+            f"Invoice shows a different address: {invoice}"
+            if invoice and invoice != master else None
+        )
+        return {
+            "recipient": master,
+            "recipient_source": "vendor master",
+            "recipient_note": note,
+            "allowlisted": master in allowlist,
+            "invoice_domain_verified": False,
+        }
+    if invoice and invoice in allowlist:
+        return {
+            "recipient": invoice,
+            "recipient_source": "from invoice, allowlisted",
+            "recipient_note": None,
+            "allowlisted": True,
+            "invoice_domain_verified": False,
+        }
+    if invoice and dynamically_authorized:
+        return {
+            "recipient": invoice,
+            "recipient_source": "automatically authorized extracted invoice email",
+            "recipient_note": None,
+            "allowlisted": False,
+            "invoice_domain_verified": True,
+        }
+    if invoice and invoice_domain_verified:
+        return {
+            "recipient": invoice,
+            "recipient_source": "from invoice, verified vendor domain",
+            "recipient_note": None,
+            "allowlisted": False,
+            "invoice_domain_verified": True,
+        }
+    return {
+        "recipient": None,
+        "recipient_source": "no verified recipient",
+        "recipient_note": None,
+        "allowlisted": False,
+        "invoice_domain_verified": False,
+    }
 
 
 def critical_field_issues(invoice):
@@ -96,28 +172,13 @@ def build_information_request(vendor_name, invoice, issues):
     }
 
 
-def notification_key(vendor_id, invoice, file_hash, issues):
-    invoice_number = invoice.get("invoice_number")
-    issue_fields = ",".join(sorted({field for field, _ in issues}))
-    if isinstance(invoice_number, str) and invoice_number.strip():
-        identity = "|".join((
-            str(vendor_id or ""),
-            invoice_number.strip().casefold(),
-            str(invoice.get("invoice_date") or ""),
-            str(invoice.get("po_reference") or ""),
-            issue_fields,
-        ))
-    else:
-        invoice_date = invoice.get("invoice_date")
-        po_number = invoice.get("po_reference")
-        total = invoice.get("total")
-        available_identity = [value for value in (invoice_date, po_number, total) if value not in (None, "")]
-        identity_parts = [str(vendor_id or ""), issue_fields]
-        if available_identity:
-            identity_parts.extend(str(value) for value in (invoice_date, po_number, total))
-        else:
-            identity_parts.append(file_hash)
-        identity = "|".join(identity_parts)
+def notification_key(vendor_id, invoice, file_hash, issues, recipient=None):
+    identity = "\0".join((
+        str(vendor_id or ""),
+        str(file_hash or ""),
+        normalize_email(recipient) or "",
+        ",".join(sorted({field for field, _ in issues})),
+    ))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
@@ -125,21 +186,36 @@ def _failure(recipient, reason):
     return {"recipient": recipient, "status": "FAILED", "error": reason}
 
 
-def delivery_eligibility(recipient):
+def _smtp_failure(recipient, stage, exc, username, password):
+    message = str(exc) or ("timed out" if isinstance(exc, TimeoutError) else "")
+    for credential in (username, password):
+        if credential:
+            message = message.replace(credential, "[redacted]")
+    message = re.sub(r"[\r\n\t]+", " ", message).strip() or "No error message"
+    error = f"SMTP {stage} failed ({type(exc).__name__}): {message[:200]}"
+    return _failure(recipient, error)
+
+
+def delivery_eligibility(
+    recipient, *, allowlisted=False, invoice_domain_verified=False, is_resend=False
+):
     mode = os.getenv("EMAIL_MODE", "demo").strip().lower() or "demo"
-    if mode not in {"demo", "smtp"}:
-        raise ValueError("EMAIL_MODE must be either demo or smtp")
+    if mode not in {"demo", "smtp", "resend"}:
+        raise ValueError("EMAIL_MODE must be demo, smtp, or resend")
     if mode == "demo":
         return False, "Drafted, demo mode, not sent"
+    if mode == "resend" and not is_resend:
+        return False, "Drafted, EMAIL_MODE=resend: initial emails are not sent"
     if not recipient:
-        return False, "Drafted, SMTP mode: no vendor recipient is registered"
-    allowlist = {
-        address.strip().casefold()
-        for address in os.getenv("EMAIL_ALLOWLIST", "").split(",")
-        if address.strip()
-    }
-    if recipient.strip().casefold() not in allowlist:
-        return False, "Drafted, SMTP mode: recipient is not in EMAIL_ALLOWLIST"
+        return False, "no verified recipient"
+    if not allowlisted and not invoice_domain_verified:
+        return False, "recipient is not in EMAIL_ALLOWLIST and has no verified vendor domain"
+    try:
+        maximum = int(os.getenv("EMAIL_MAX_PER_HOUR", "5"))
+    except ValueError:
+        return False, "EMAIL_MAX_PER_HOUR must be a positive integer"
+    if maximum < 1:
+        return False, "EMAIL_MAX_PER_HOUR must be a positive integer"
     host = os.getenv("SMTP_HOST", "").strip()
     sender = (os.getenv("SMTP_FROM_EMAIL") or os.getenv("SMTP_FROM") or "").strip()
     if not host or not sender:
@@ -177,6 +253,7 @@ def send_email(recipient, subject, body):
     if bool(username) != bool(password):
         return _failure(recipient, "Configure both SMTP_USER and SMTP_PASSWORD, or neither")
 
+    stage = "connect"
     try:
         port = int(os.getenv("SMTP_PORT", "587"))
         if not 1 <= port <= 65535:
@@ -188,18 +265,20 @@ def send_email(recipient, subject, body):
         message.set_content(body)
 
         with smtplib.SMTP(host, port, timeout=20) as server:
+            stage = "starttls"
             server.ehlo()
             server.starttls(context=ssl.create_default_context())
             server.ehlo()
+            stage = "login"
             if username:
                 server.login(username, password)
+            stage = "send"
             refused = server.send_message(message)
         if refused:
-            return _failure(recipient, f"SMTP server refused recipient: {refused}")
+            return _failure(
+                recipient,
+                f"SMTP send failed (SMTPRecipientsRefused): {str(refused)[:200]}",
+            )
         return {"recipient": recipient, "status": "SENT", "error": None}
-    except smtplib.SMTPAuthenticationError:
-        return _failure(recipient, "SMTP authentication failed; check SMTP_USER and SMTP_PASSWORD")
-    except (TimeoutError, socket.timeout):
-        return _failure(recipient, "SMTP connection timed out")
     except (OSError, smtplib.SMTPException, ValueError) as exc:
-        return _failure(recipient, f"SMTP delivery failed: {exc}")
+        return _smtp_failure(recipient, stage, exc, username, password)

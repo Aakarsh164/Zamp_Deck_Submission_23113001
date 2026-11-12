@@ -30,7 +30,14 @@ make("2_bundled_tax_apex.pdf", [
 make("3_missing_total_meridian.pdf", [
     (18, "Meridian Print & Packaging"), (11, "Invoice date: 04 Nov 2026"), (11, ""),
     (11, "Retail boxes, 5,000 units"), (11, "Amount to be confirmed"), (11, "Bank account ending 1204")])
-print("Created 3 PDFs in test_invoices/")
+
+test_vendor_email = os.getenv("TEST_VENDOR_EMAIL", "vendor@example.com")
+make("5_missing_with_contact_email.pdf", [
+    (18, "Meridian Print & Packaging"), (11, "Invoice date: 04 Nov 2026"),
+    (11, "Accounts: " + test_vendor_email), (11, ""),
+    (11, "Retail boxes, 5,000 units"), (11, "Amount to be confirmed"),
+    (11, "Bank account ending 1204")])
+print("Created 4 PDFs in test_invoices/")
 
 # A photo-style "scan" (image, no text layer) to test the Gemini image path
 from PIL import Image, ImageDraw, ImageFont
